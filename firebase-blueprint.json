@@ -1,0 +1,274 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Authenticated farmer or administrator account metadata stored in Firestore.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the account owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified email address of the user.",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Display name of the user.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "role": {
+          "type": "string",
+          "enum": ["farmer", "admin"],
+          "description": "Role of the user. Client writes may only initialize role as farmer."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the account record was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the account record was last updated."
+        }
+      },
+      "required": ["uid", "email", "fullName", "role", "createdAt", "updatedAt"]
+    },
+    "FarmerProfile": {
+      "title": "FarmerProfile",
+      "description": "Private agricultural profile details and PII isolated under the user's private subcollection.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the farmer owning this profile.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Farmer full name.",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "age": {
+          "type": "integer",
+          "description": "Farmer age in years (18 to 110)."
+        },
+        "gender": {
+          "type": "string",
+          "description": "Optional gender selection.",
+          "maxLength": 32
+        },
+        "state": {
+          "type": "string",
+          "description": "Indian state or UT.",
+          "maxLength": 80
+        },
+        "district": {
+          "type": "string",
+          "description": "District name.",
+          "maxLength": 80
+        },
+        "village": {
+          "type": "string",
+          "description": "Village or taluk name.",
+          "maxLength": 80
+        },
+        "farmerCategory": {
+          "type": "string",
+          "description": "Landholding farmer category.",
+          "maxLength": 64
+        },
+        "landHoldingAcres": {
+          "type": "string",
+          "description": "Cultivable landholding size in acres.",
+          "maxLength": 24
+        },
+        "mainCrop": {
+          "type": "string",
+          "description": "Primary cultivated crop.",
+          "maxLength": 80
+        },
+        "irrigationAvailability": {
+          "type": "string",
+          "description": "Primary irrigation source.",
+          "maxLength": 80
+        },
+        "farmingType": {
+          "type": "string",
+          "description": "Farming practice type.",
+          "maxLength": 80
+        },
+        "mobileNumber": {
+          "type": "string",
+          "description": "Optional farmer contact mobile number.",
+          "maxLength": 20
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last profile update."
+        }
+      },
+      "required": ["userId", "fullName", "updatedAt"]
+    },
+    "RecentlyViewedScheme": {
+      "title": "RecentlyViewedScheme",
+      "description": "Tracks schemes recently viewed by a farmer for quick dashboard access.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the farmer.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "schemeId": {
+          "type": "integer",
+          "description": "Numeric scheme identifier."
+        },
+        "slug": {
+          "type": "string",
+          "description": "URL slug of the viewed government scheme.",
+          "minLength": 1,
+          "maxLength": 120,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "shortName": {
+          "type": "string",
+          "description": "Short display title of the scheme.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "governmentLevel": {
+          "type": "string",
+          "description": "Central or State scheme level.",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "viewedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the scheme was viewed."
+        }
+      },
+      "required": ["userId", "schemeId", "slug", "shortName", "governmentLevel", "viewedAt"]
+    },
+    "ContactMessage": {
+      "title": "ContactMessage",
+      "description": "Support or feedback inquiry submitted by a verified user.",
+      "type": "object",
+      "properties": {
+        "senderUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user submitting the inquiry.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Sender full name.",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Sender email address.",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "phone": {
+          "type": "string",
+          "description": "Optional sender phone number.",
+          "maxLength": 24
+        },
+        "subject": {
+          "type": "string",
+          "description": "Inquiry subject line.",
+          "minLength": 2,
+          "maxLength": 200
+        },
+        "message": {
+          "type": "string",
+          "description": "Detailed message body.",
+          "minLength": 5,
+          "maxLength": 2000
+        },
+        "status": {
+          "type": "string",
+          "enum": ["new", "reviewed"],
+          "description": "Triage status of the contact inquiry."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the inquiry was submitted."
+        }
+      },
+      "required": ["senderUid", "name", "email", "subject", "message", "status", "createdAt"]
+    },
+    "AdminMarker": {
+      "title": "AdminMarker",
+      "description": "Server/bootstrapped administrator authorization document.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the administrator.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Administrator email address.",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when admin access was recorded."
+        }
+      },
+      "required": ["uid", "email", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "Owner-isolated user account records."
+    },
+    "/users/{userId}/private/{profileId}": {
+      "schema": { "$ref": "#/entities/FarmerProfile" },
+      "description": "Isolated PII and agricultural profile document for each farmer."
+    },
+    "/users/{userId}/recentlyViewed/{schemeSlug}": {
+      "schema": { "$ref": "#/entities/RecentlyViewedScheme" },
+      "description": "Farmer's recently viewed government schemes."
+    },
+    "/contactMessages/{messageId}": {
+      "schema": { "$ref": "#/entities/ContactMessage" },
+      "description": "Farmer portal inquiries readable by the sender or admins."
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminMarker" },
+      "description": "Administrator role registry."
+    }
+  }
+}

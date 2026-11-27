@@ -13,56 +13,57 @@ import {
   Tractor,
   FlaskConical,
   Store,
-  Stethoscope,
   CloudSun,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { TranslatedText, useTranslatedTexts } from '../context/DynamicTranslationContext';
 import {
+  fetchDirectionsRoute,
   fetchWeather,
-  getGoogleMapsApiKey,
+  geocodeLocation,
   searchNearbyAgriPlaces,
 } from '../services/api';
 import { getNormalizedLang } from '../translations/i18n';
 import { AgriServicesMap } from '../components/AgriServicesMap';
-import type { AgriPlaceItem, WeatherReport } from '../types';
+import type { AgriPlaceItem, RouteInfo, WeatherReport } from '../types';
 
 interface ServiceCategory {
   id: string;
   query: string;
+  queries: string[];
   icon: React.FC<{ className?: string }>;
 }
 
 const AGRI_CATEGORIES: ServiceCategory[] = [
   {
     id: 'mandi',
-    query: 'APMC market yard agricultural produce market',
+    query: 'APMC',
+    queries: ['APMC', 'agricultural produce market'],
     icon: Store,
   },
   {
     id: 'rsk',
-    query: 'Raitha Samparka Kendra OR agriculture extension office',
+    query: 'Raitha Samparka Kendra',
+    queries: ['Raitha Samparka Kendra', 'agriculture department office'],
     icon: Building2,
   },
   {
     id: 'kvk',
-    query: 'Krishi Vigyan Kendra OR soil testing laboratory',
+    query: 'Krishi Vigyan Kendra',
+    queries: ['Krishi Vigyan Kendra', 'soil testing laboratory'],
     icon: FlaskConical,
   },
   {
     id: 'seeds',
-    query: 'agriculture seeds fertilizer agro center',
+    query: 'fertilizer store',
+    queries: ['fertilizer store', 'agriculture seeds shop'],
     icon: Sprout,
   },
   {
     id: 'machinery',
-    query: 'tractor dealer agricultural machinery showroom',
+    query: 'tractor dealer',
+    queries: ['tractor dealer', 'agricultural machinery'],
     icon: Tractor,
-  },
-  {
-    id: 'vet',
-    query: 'veterinary hospital dairy cooperative milk center',
-    icon: Stethoscope,
   },
 ];
 
@@ -80,7 +81,6 @@ export const AgriMapPage: React.FC = () => {
       ? `${profile.state}, India`
       : 'Mandya, Karnataka, India';
 
-  const [apiKey, setApiKey] = useState('');
   const [locationInput, setLocationInput] = useState(initialLocation);
   const [customQuery, setCustomQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<ServiceCategory>(AGRI_CATEGORIES[0]);
@@ -91,37 +91,45 @@ export const AgriMapPage: React.FC = () => {
   const [weatherSummary, setWeatherSummary] = useState<WeatherReport | null>(null);
   const [places, setPlaces] = useState<AgriPlaceItem[]>([]);
   const [selectedPlaceId, setSelectedPlaceId] = useState<string | null>(null);
+  const [activeRoute, setActiveRoute] = useState<RouteInfo | null>(null);
+  const [loadingRouteId, setLoadingRouteId] = useState<string | null>(null);
 
   const [loadingPlaces, setLoadingPlaces] = useState(false);
   const [locating, setLocating] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const initializedRef = useRef(false);
 
-  useEffect(() => {
-    getGoogleMapsApiKey().then((k) => setApiKey(k)).catch(() => {});
-  }, []);
+  const hasResolvedLocationRef = useRef(false);
 
   const runSearchForCenter = async (
     coords: { lat: number; lng: number },
-    queryText: string,
+    queryInputParam: string | string[],
     radius = radiusMeters,
-    lang = currentLang
+    lang = currentLang,
+    categoryId?: string
   ) => {
     setLoadingPlaces(true);
     setErrorMsg(null);
     setSelectedPlaceId(null);
+    setActiveRoute(null);
     try {
+      const textQueries = Array.isArray(queryInputParam)
+        ? queryInputParam
+        : [queryInputParam];
       const results = await searchNearbyAgriPlaces({
-        textQuery: queryText,
+        categoryId,
+        textQuery: textQueries[0],
+        textQueries,
         lat: coords.lat,
         lng: coords.lng,
         radiusMeters: radius,
         languageCode: lang,
       });
-      setPlaces(results);
-      if (results.length > 0) {
-        setSelectedPlaceId(results[0].id);
-      }
+      const maxKm = radius / 1000;
+      const filteredSorted = results
+        .filter((p) => p.distanceKm == null || p.distanceKm <= maxKm)
+        .sort((a, b) => (a.distanceKm ?? 0) - (b.distanceKm ?? 0));
+      setPlaces(filteredSorted);
     } catch (err) {
       setErrorMsg(
         err instanceof Error ? err.message : t('agriMap.placesError')
@@ -134,39 +142,70 @@ export const AgriMapPage: React.FC = () => {
 
   const resolveLocationAndSearch = async (
     params: { location?: string; lat?: number; lng?: number },
-    queryText: string,
+    queryInputParam: string | string[],
     radius = radiusMeters,
-    lang = currentLang
+    lang = currentLang,
+    categoryId?: string
   ) => {
     setLoadingPlaces(true);
     setErrorMsg(null);
+    setSelectedPlaceId(null);
+    setActiveRoute(null);
     try {
-      const weatherData = await fetchWeather({ ...params, lang });
-      const nextCenter = { lat: weatherData.latitude, lng: weatherData.longitude };
+      const geo = await geocodeLocation({ ...params, lang });
+      const nextCenter = { lat: geo.latitude, lng: geo.longitude };
+      hasResolvedLocationRef.current = true;
       setCenter(nextCenter);
-      setCenterLabel(weatherData.locationName);
-      setWeatherSummary(weatherData);
-      await runSearchForCenter(nextCenter, queryText, radius, lang);
+      setCenterLabel(geo.locationName);
+      if (params.lat !== undefined && params.lng !== undefined && geo.locationName) {
+        setLocationInput(geo.locationName);
+      }
+
+      // Fetch weather non-blockingly using exact same coordinates
+      void fetchWeather({
+        lat: nextCenter.lat,
+        lng: nextCenter.lng,
+        locationName: geo.locationName,
+        lang,
+      })
+        .then((weatherData) => {
+          setWeatherSummary(weatherData);
+        })
+        .catch(() => {
+          setWeatherSummary(null);
+        });
+
+      await runSearchForCenter(nextCenter, queryInputParam, radius, lang, categoryId);
     } catch (err) {
+      setPlaces([]);
+      setWeatherSummary(null);
       setErrorMsg(err instanceof Error ? err.message : t('agriMap.locationError'));
       setLoadingPlaces(false);
     }
   };
 
-  const activeQueryString = customQuery.trim()
+  const activeCategoryId = customQuery.trim() ? undefined : selectedCategory.id;
+  const activeQueryParam: string | string[] = customQuery.trim()
     ? customQuery.trim()
-    : selectedCategory.query;
+    : selectedCategory.queries;
 
   useEffect(() => {
     if (!initializedRef.current) {
       initializedRef.current = true;
-      void resolveLocationAndSearch({ location: initialLocation }, AGRI_CATEGORIES[0].query, 25000, currentLang);
-    } else {
+      void resolveLocationAndSearch(
+        { location: initialLocation },
+        AGRI_CATEGORIES[0].queries,
+        25000,
+        currentLang,
+        AGRI_CATEGORIES[0].id
+      );
+    } else if (hasResolvedLocationRef.current) {
       void resolveLocationAndSearch(
         { lat: center.lat, lng: center.lng },
-        activeQueryString,
+        activeQueryParam,
         radiusMeters,
-        currentLang
+        currentLang,
+        activeCategoryId
       );
     }
     // Re-localize geocoded location, weather summary, and places when language changes
@@ -177,7 +216,7 @@ export const AgriMapPage: React.FC = () => {
     return [
       centerLabel,
       weatherSummary?.locationName,
-      weatherSummary?.current.conditionText,
+      weatherSummary?.current?.conditionText,
       ...places.flatMap((p) => [p.name, p.address, p.primaryType]),
     ];
   }, [centerLabel, weatherSummary, places]);
@@ -187,24 +226,50 @@ export const AgriMapPage: React.FC = () => {
   const handleLocationSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!locationInput.trim()) return;
-    void resolveLocationAndSearch({ location: locationInput.trim() }, activeQueryString, radiusMeters);
+    void resolveLocationAndSearch(
+      { location: locationInput.trim() },
+      activeQueryParam,
+      radiusMeters,
+      currentLang,
+      activeCategoryId
+    );
   };
 
   const handleCustomQuerySubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!customQuery.trim()) return;
-    void runSearchForCenter(center, customQuery.trim(), radiusMeters);
+    void runSearchForCenter(center, customQuery.trim(), radiusMeters, currentLang, undefined);
   };
 
   const handleCategoryClick = (cat: ServiceCategory) => {
     setSelectedCategory(cat);
     setCustomQuery('');
-    void runSearchForCenter(center, cat.query, radiusMeters);
+    void runSearchForCenter(center, cat.queries, radiusMeters, currentLang, cat.id);
   };
 
   const handleRadiusChange = (nextRadius: number) => {
     setRadiusMeters(nextRadius);
-    void runSearchForCenter(center, activeQueryString, nextRadius);
+    void runSearchForCenter(center, activeQueryParam, nextRadius, currentLang, activeCategoryId);
+  };
+
+  const handleShowRoute = async (place: AgriPlaceItem) => {
+    setSelectedPlaceId(place.id);
+    setLoadingRouteId(place.id);
+    setErrorMsg(null);
+    try {
+      const route = await fetchDirectionsRoute({
+        fromLat: center.lat,
+        fromLng: center.lng,
+        toLat: place.latitude,
+        toLng: place.longitude,
+      });
+      setActiveRoute(route);
+    } catch (err) {
+      setActiveRoute(null);
+      setErrorMsg(err instanceof Error ? err.message : t('agriMap.placesError'));
+    } finally {
+      setLoadingRouteId(null);
+    }
   };
 
   const handleUseGps = () => {
@@ -221,7 +286,13 @@ export const AgriMapPage: React.FC = () => {
           lat: Number(pos.coords.latitude.toFixed(4)),
           lng: Number(pos.coords.longitude.toFixed(4)),
         };
-        void resolveLocationAndSearch(coords, activeQueryString, radiusMeters);
+        void resolveLocationAndSearch(
+          coords,
+          activeQueryParam,
+          radiusMeters,
+          currentLang,
+          activeCategoryId
+        );
       },
       () => {
         setLocating(false);
@@ -246,7 +317,7 @@ export const AgriMapPage: React.FC = () => {
           </p>
         </div>
 
-        {weatherSummary && (
+        {weatherSummary?.current && (
           <div className="bg-[#F5F8F5] border border-[#E5E7EB] rounded-lg px-4 py-3 flex items-center gap-4 shrink-0">
             <CloudSun className="w-8 h-8 text-[#F47721] shrink-0" aria-hidden="true" />
             <div>
@@ -254,13 +325,14 @@ export const AgriMapPage: React.FC = () => {
                 {tr(weatherSummary.locationName)}
               </div>
               <div className="text-sm font-bold text-[#303030] tabular-nums">
-                {weatherSummary.current.temperatureC !== null
+                {weatherSummary.current.temperatureC !== null &&
+                weatherSummary.current.temperatureC !== undefined
                   ? `${Math.round(weatherSummary.current.temperatureC)}°C`
                   : '--'}{' '}
-                · {tr(weatherSummary.current.conditionText)}
+                · {tr(weatherSummary.current.conditionText || 'Clear')}
               </div>
               <div className="text-[11px] text-[#207747] tabular-nums">
-                {t('agriMap.rainChance', { pct: weatherSummary.current.rainProbability })} ·{' '}
+                {t('agriMap.rainChance', { pct: weatherSummary.current.rainProbability ?? 0 })} ·{' '}
                 {center.lat.toFixed(2)}°N, {center.lng.toFixed(2)}°E
               </div>
             </div>
@@ -269,7 +341,7 @@ export const AgriMapPage: React.FC = () => {
       </div>
 
       {/* Location & Category Controls */}
-      <div className="bg-white border border-[#E5E7EB] rounded-xl p-5 space-y-4">
+      <div className="bg-white border border-[#E5E7EB] rounded-xl p-5 sm:p-6 space-y-4">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-3">
           {/* Location Lookup */}
           <form onSubmit={handleLocationSubmit} className="lg:col-span-6 flex flex-wrap sm:flex-nowrap gap-2">
@@ -327,6 +399,7 @@ export const AgriMapPage: React.FC = () => {
               onChange={(e) => handleRadiusChange(Number(e.target.value))}
               className="px-3 py-2 text-sm border border-[#E5E7EB] rounded bg-white text-[#303030]"
             >
+              <option value={5000}>{t('agriMap.within5Km')}</option>
               <option value={10000}>{t('agriMap.within10Km')}</option>
               <option value={25000}>{t('agriMap.within25Km')}</option>
               <option value={50000}>{t('agriMap.within50Km')}</option>
@@ -342,7 +415,7 @@ export const AgriMapPage: React.FC = () => {
         </div>
 
         {/* Service Category Filters */}
-        <div className="flex flex-wrap gap-2 pt-1">
+        <div className="flex flex-wrap items-center gap-2.5 pt-1">
           {AGRI_CATEGORIES.map((cat) => {
             const Icon = cat.icon;
             const active = !customQuery.trim() && selectedCategory.id === cat.id;
@@ -351,7 +424,7 @@ export const AgriMapPage: React.FC = () => {
                 key={cat.id}
                 type="button"
                 onClick={() => handleCategoryClick(cat)}
-                className={`inline-flex items-center gap-1.5 px-3 py-2 rounded text-xs sm:text-sm font-semibold border transition-colors ${
+                className={`flex-1 min-w-fit inline-flex items-center justify-center gap-2 px-4 py-2 rounded text-xs sm:text-sm font-semibold border whitespace-nowrap transition-colors ${
                   active
                     ? 'bg-[#17613A] text-white border-[#17613A]'
                     : 'bg-[#F5F8F5] text-[#17613A] border-[#E5E7EB] hover:border-[#17613A]/50'
@@ -378,16 +451,35 @@ export const AgriMapPage: React.FC = () => {
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         <div className="lg:col-span-7 bg-white border border-[#E5E7EB] rounded-xl p-3">
           <AgriServicesMap
-            apiKey={apiKey}
             center={center}
             centerLabel={centerLabel}
             places={places}
             selectedPlaceId={selectedPlaceId}
             onSelectPlace={(p) => setSelectedPlaceId(p ? p.id : null)}
+            onShowRoute={handleShowRoute}
+            routeCoordinates={activeRoute?.coordinates || null}
+            radiusMeters={radiusMeters}
             heightClassName="h-[440px] sm:h-[540px]"
             zoom={12}
-            language={currentLang}
           />
+          {activeRoute && (
+            <div className="mt-2.5 px-3 py-2 bg-[#F5F8F5] border border-[#E5E7EB] rounded-lg flex flex-wrap items-center justify-between gap-2 text-xs">
+              <span className="font-semibold text-[#17613A] tabular-nums">
+                {t('agriMap.routeSummary', {
+                  km: activeRoute.distanceKm.toFixed(1),
+                  min: Math.max(1, Math.round(activeRoute.durationMin)),
+                })}{' '}
+                <span className="font-normal text-[#303030]/70">({activeRoute.provider})</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => setActiveRoute(null)}
+                className="text-xs font-semibold text-[#F47721] hover:underline"
+              >
+                {t('agriMap.clearRoute')}
+              </button>
+            </div>
+          )}
           <div className="mt-2.5 px-1 flex flex-wrap items-center justify-between gap-2 text-xs text-[#303030]/75">
             <span>
               {t('agriMap.centeredOn')}{' '}
@@ -472,11 +564,18 @@ export const AgriMapPage: React.FC = () => {
                           {tr(place.name)}
                         </h3>
                       </div>
-                      {place.businessStatus === 'OPERATIONAL' && (
-                        <span className="text-[10px] font-semibold px-2 py-0.5 bg-[#E6EFE9] text-[#17613A] rounded shrink-0">
-                          {t('agriMap.openListing')}
-                        </span>
-                      )}
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {typeof place.distanceKm === 'number' && (
+                          <span className="text-[11px] font-bold px-2 py-0.5 bg-[#F5F8F5] border border-[#E5E7EB] text-[#17613A] rounded tabular-nums">
+                            {place.distanceKm.toFixed(1)} km
+                          </span>
+                        )}
+                        {place.businessStatus === 'OPERATIONAL' && (
+                          <span className="text-[10px] font-semibold px-2 py-0.5 bg-[#E6EFE9] text-[#17613A] rounded">
+                            {t('agriMap.openListing')}
+                          </span>
+                        )}
+                      </div>
                     </div>
 
                     <p className="mt-1.5 text-xs text-[#303030]/80 leading-relaxed">
@@ -484,28 +583,44 @@ export const AgriMapPage: React.FC = () => {
                     </p>
 
                     <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void handleShowRoute(place);
+                        }}
+                        disabled={loadingRouteId === place.id}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 bg-[#17613A] hover:bg-[#207747] disabled:opacity-60 text-white text-xs font-semibold rounded"
+                      >
+                        <Navigation className="w-3 h-3" aria-hidden="true" />
+                        <span>
+                          {loadingRouteId === place.id
+                            ? t('agriMap.loadingRoute')
+                            : t('agriMap.showRoute')}
+                        </span>
+                      </button>
                       {place.directionsUri && (
                         <a
                           href={place.directionsUri}
                           target="_blank"
                           rel="noopener noreferrer"
                           onClick={(e) => e.stopPropagation()}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 bg-[#17613A] hover:bg-[#207747] text-white text-xs font-semibold rounded"
+                          className="inline-flex items-center gap-1 px-2.5 py-1 bg-[#F47721] hover:bg-[#d96312] text-white text-xs font-semibold rounded"
                         >
-                          <Navigation className="w-3 h-3" aria-hidden="true" />
+                          <ExternalLink className="w-3 h-3" aria-hidden="true" />
                           <span>{t('agriMap.getDirections')}</span>
                         </a>
                       )}
-                      {place.googleMapsUri && (
+                      {place.osmUri && (
                         <a
-                          href={place.googleMapsUri}
+                          href={place.osmUri}
                           target="_blank"
                           rel="noopener noreferrer"
                           onClick={(e) => e.stopPropagation()}
                           className="inline-flex items-center gap-1 px-2.5 py-1 border border-[#E5E7EB] bg-white hover:bg-[#F5F8F5] text-[#17613A] text-xs font-semibold rounded"
                         >
                           <ExternalLink className="w-3 h-3" aria-hidden="true" />
-                          <span>{t('agriMap.googleMaps')}</span>
+                          <span>{t('agriMap.openStreetMap')}</span>
                         </a>
                       )}
                     </div>

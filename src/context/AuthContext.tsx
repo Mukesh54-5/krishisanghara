@@ -163,9 +163,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       credentials: 'same-origin',
       body: JSON.stringify({ email: email.trim(), password }),
     });
-    const data = await res.json().catch(() => ({}));
+    const rawText = await res.text().catch(() => '');
+    let data: Record<string, any> = {};
+    try {
+      data = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      data = {};
+    }
     if (!res.ok) {
-      throw new Error(data.error || 'Login failed.');
+      throw new Error(data.error || rawText || `Login failed (HTTP ${res.status}).`);
     }
     setToken(data.token);
     setUser(data.user);
@@ -196,9 +202,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         mobileNumber: payload.mobileNumber.trim(),
       }),
     });
-    const data = await res.json().catch(() => ({}));
+    const rawText = await res.text().catch(() => '');
+    let data: Record<string, any> = {};
+    try {
+      data = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      data = {};
+    }
     if (!res.ok) {
-      throw new Error(data.error || 'Registration failed.');
+      throw new Error(data.error || rawText || `Registration failed (HTTP ${res.status}).`);
     }
     setToken(data.token);
     setUser(data.user);

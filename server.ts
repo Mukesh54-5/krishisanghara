@@ -356,7 +356,9 @@ app.get('/api/health', (_req, res) => {
 // Auth: Register with Email/Mobile/Password
 app.post('/api/register', async (req, res) => {
   try {
-    await ensureSeeded();
+    await ensureSeeded().catch((seedErr) => {
+      console.warn('Background seed skipped during registration:', seedErr);
+    });
     const { fullName, email, mobileNumber, password, confirmPassword } = req.body ?? {};
 
     if (!fullName || typeof fullName !== 'string' || fullName.trim().length < 2) {
@@ -433,14 +435,23 @@ app.post('/api/register', async (req, res) => {
     });
   } catch (error) {
     console.error('Register error:', error);
-    res.status(500).json({ error: 'Registration failed. Please try again.' });
+    const rawMsg = error instanceof Error ? error.message : String(error || '');
+    const lower = rawMsg.toLowerCase();
+    if (lower.includes('duplicate key') || lower.includes('unique constraint') || lower.includes('23505')) {
+      return res.status(409).json({ error: 'An account with this email already exists.' });
+    }
+    res.status(500).json({
+      error: rawMsg || 'Registration failed due to a server error.',
+    });
   }
 });
 
 // Auth: Login with Email & Password
 app.post('/api/login', async (req, res) => {
   try {
-    await ensureSeeded();
+    await ensureSeeded().catch((seedErr) => {
+      console.warn('Background seed skipped during login:', seedErr);
+    });
     const { email, password } = req.body ?? {};
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required.' });
@@ -488,7 +499,10 @@ app.post('/api/login', async (req, res) => {
     });
   } catch (error) {
     console.error('Login error:', error);
-    res.status(500).json({ error: 'Login failed. Please try again.' });
+    const rawMsg = error instanceof Error ? error.message : String(error || '');
+    res.status(500).json({
+      error: rawMsg || 'Login failed due to a server error.',
+    });
   }
 });
 
@@ -1272,412 +1286,1447 @@ function buildWeatherAdvisories(
   return advisories;
 }
 
-// Provide public Maps JavaScript API key config cleanly to the React client
-app.get('/api/maps/config', (_req, res) => {
-  const apiKey =
-    process.env.VITE_GOOGLE_MAPS_API_KEY ||
-    process.env.GOOGLE_MAPS_API_KEY ||
-    process.env.MAPS_API_KEY ||
-    '';
-  res.json({ apiKey });
-});
+const OSM_USER_AGENT = 'KrishiSangrah/1.0 (https://krishi-sangrah.vercel.app; agricultural-portal)';
+const NOMINATIM_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const OVERPASS_CACHE_TTL_MS = 30 * 60 * 1000;
+const DIRECTIONS_CACHE_TTL_MS = 30 * 60 * 1000;
 
-// Places API (New) Text Search proxy for nearby Mandis, Raitha Samparka Kendras, KVKs & Agri Services
-app.post('/api/maps/places', async (req, res) => {
-  try {
-    const apiKey =
-      process.env.GOOGLE_MAPS_API_KEY ||
-      process.env.VITE_GOOGLE_MAPS_API_KEY ||
-      process.env.MAPS_API_KEY;
+interface CacheEntry<T> {
+  expiresAt: number;
+  value: T;
+}
 
-    if (!apiKey) {
-      return res.status(503).json({
-        error: 'Google Maps API key is not configured on the server.',
-      });
+const nominatimCache = new Map<
+  string,
+  CacheEntry<{ latitude: number; longitude: number; locationName: string }>
+>();
+const nominatimInFlight = new Map<
+  string,
+  Promise<
+    | { ok: true; latitude: number; longitude: number; locationName: string }
+    | { ok: false; status: number; error: string }
+  >
+>();
+let lastNominatimCallAt = 0;
+let nominatimSlotChain: Promise<void> = Promise.resolve();
+
+function waitForNominatimSlot(): Promise<void> {
+  const next = nominatimSlotChain.then(async () => {
+    const now = Date.now();
+    const elapsed = now - lastNominatimCallAt;
+    if (elapsed < 1050) {
+      await new Promise((resolve) => setTimeout(resolve, 1050 - elapsed));
+    }
+    lastNominatimCallAt = Date.now();
+  });
+  nominatimSlotChain = next.catch(() => {});
+  return next;
+}
+
+const overpassCache = new Map<
+  string,
+  CacheEntry<
+    Array<{
+      id: string;
+      name: string;
+      address: string;
+      latitude: number;
+      longitude: number;
+      distanceKm: number;
+      primaryType: string | null;
+      businessStatus: string | null;
+      osmUri: string | null;
+      directionsUri: string | null;
+    }>
+  >
+>();
+const overpassInFlight = new Map<string, Promise<unknown>>();
+
+const directionsCache = new Map<
+  string,
+  CacheEntry<{
+    coordinates: Array<[number, number]>;
+    distanceKm: number;
+    durationMin: number;
+    provider: string;
+  }>
+>();
+
+function haversineDistanceKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const earthRadiusKm = 6371;
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return earthRadiusKm * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function escapeOverpassRegex(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\"]/g, '\\$&').trim();
+}
+
+function inferAgriCategory(categoryId: unknown, queryList: string[]): string | null {
+  if (typeof categoryId === 'string' && categoryId.trim()) {
+    return categoryId.trim().toLowerCase();
+  }
+  const joined = queryList.join(' ').toLowerCase();
+  if (joined.includes('apmc') || joined.includes('mandi') || joined.includes('agricultural produce market')) {
+    return 'mandi';
+  }
+  if (joined.includes('raitha samparka') || joined.includes('agriculture department office')) {
+    return 'rsk';
+  }
+  if (joined.includes('krishi vigyan') || joined.includes('soil testing')) {
+    return 'kvk';
+  }
+  if (joined.includes('fertilizer store') || joined.includes('agriculture seeds')) {
+    return 'seeds';
+  }
+  if (joined.includes('tractor dealer') || joined.includes('agricultural machinery')) {
+    return 'machinery';
+  }
+  return null;
+}
+
+function buildOverpassQuery(opts: {
+  lat: number;
+  lng: number;
+  radiusMeters: number;
+  category: string | null;
+  queryList: string[];
+}): string {
+  const { lat, lng, radiusMeters, category, queryList } = opts;
+  const r = Math.round(radiusMeters);
+  const coord = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+  const clauses: string[] = [];
+
+  switch (category) {
+    case 'mandi':
+      clauses.push(
+        `nwr["amenity"="marketplace"](around:${r},${coord});`,
+        `nwr["shop"="farm"](around:${r},${coord});`
+      );
+      break;
+    case 'rsk':
+      clauses.push(
+        `nwr["office"="agriculture"](around:${r},${coord});`,
+        `nwr["amenity"="veterinary"](around:${r},${coord});`
+      );
+      break;
+    case 'kvk':
+      clauses.push(
+        `nwr["office"="research"](around:${r},${coord});`,
+        `nwr["amenity"="research_institute"](around:${r},${coord});`,
+        `nwr["amenity"="laboratory"](around:${r},${coord});`
+      );
+      break;
+    case 'seeds':
+      clauses.push(
+        `nwr["shop"="agrarian"](around:${r},${coord});`,
+        `nwr["shop"="garden_centre"](around:${r},${coord});`,
+        `nwr["shop"="farm"](around:${r},${coord});`
+      );
+      break;
+    case 'machinery':
+      clauses.push(
+        `nwr["craft"="agricultural_engines"](around:${r},${coord});`,
+        `nwr["shop"="agrarian"](around:${r},${coord});`,
+        `nwr["shop"="machinery"](around:${r},${coord});`,
+        `nwr["shop"="tractor"](around:${r},${coord});`
+      );
+      break;
+    default: {
+      const lowerJoined = queryList.join(' ').toLowerCase();
+      if (lowerJoined.includes('seed') || lowerJoined.includes('fertilizer') || lowerJoined.includes('agro') || lowerJoined.includes('nursery')) {
+        clauses.push(
+          `nwr["shop"="agrarian"](around:${r},${coord});`,
+          `nwr["shop"="garden_centre"](around:${r},${coord});`,
+          `nwr["shop"="farm"](around:${r},${coord});`
+        );
+      }
+      if (lowerJoined.includes('mandi') || lowerJoined.includes('market') || lowerJoined.includes('apmc')) {
+        clauses.push(`nwr["amenity"="marketplace"](around:${r},${coord});`);
+      }
+      if (lowerJoined.includes('vet') || lowerJoined.includes('dairy')) {
+        clauses.push(
+          `nwr["amenity"="veterinary"](around:${r},${coord});`,
+          `nwr["shop"="dairy"](around:${r},${coord});`
+        );
+      }
+      if (lowerJoined.includes('tractor') || lowerJoined.includes('machinery') || lowerJoined.includes('equipment')) {
+        clauses.push(
+          `nwr["craft"="agricultural_engines"](around:${r},${coord});`,
+          `nwr["shop"="agrarian"](around:${r},${coord});`
+        );
+      }
+      if (clauses.length === 0) {
+        const safeTerms = queryList
+          .flatMap((q) => q.split(/[,/]+/))
+          .map((s) => escapeOverpassRegex(s))
+          .filter((s) => s.length >= 3)
+          .slice(0, 3);
+        const pattern = safeTerms.join('|') || 'APMC|Krishi|Agro';
+        clauses.push(`nwr["name"~"${pattern}",i](around:${Math.min(r, 25000)},${coord});`);
+      }
+      break;
+    }
+  }
+
+  return `[out:json][timeout:14];\n(\n  ${clauses.join('\n  ')}\n);\nout center tags;`;
+}
+
+function formatOsmAddress(tags: Record<string, string>, fallbackLat: number, fallbackLng: number): string {
+  if (tags['addr:full']) {
+    return tags['addr:full'];
+  }
+  const parts = [
+    tags['addr:housename'],
+    tags['addr:housenumber'],
+    tags['addr:street'],
+    tags['addr:suburb'] || tags['addr:locality'] || tags['addr:neighbourhood'],
+    tags['addr:village'] || tags['addr:town'] || tags['addr:city'],
+    tags['addr:district'] || tags['addr:state_district'],
+    tags['addr:state'],
+    tags['addr:postcode'],
+  ]
+    .map((p) => (typeof p === 'string' ? p.trim() : ''))
+    .filter(Boolean);
+
+  if (parts.length > 0) {
+    return Array.from(new Set(parts)).join(', ');
+  }
+  if (tags['is_in']) {
+    return tags['is_in'];
+  }
+  return `OpenStreetMap Location (${fallbackLat.toFixed(4)}°N, ${fallbackLng.toFixed(4)}°E)`;
+}
+
+function formatOsmPrimaryType(tags: Record<string, string>, category: string | null): string {
+  const nameLower = (tags.name || '').toLowerCase();
+  if (nameLower.includes('apmc') || nameLower.includes('mandi')) return 'APMC Mandi / Market';
+  if (nameLower.includes('raitha samparka')) return 'Raitha Samparka Kendra';
+  if (nameLower.includes('krishi vigyan') || nameLower.includes('kvk')) return 'Krishi Vigyan Kendra';
+  if (nameLower.includes('soil')) return 'Soil Testing Lab';
+  if (tags.shop === 'agrarian' || nameLower.includes('seed') || nameLower.includes('fertilizer')) {
+    return 'Seeds & Fertilizers';
+  }
+  if (tags.craft === 'agricultural_engines' || nameLower.includes('tractor') || nameLower.includes('machinery')) {
+    return 'Tractors & Equipment';
+  }
+  if (tags.amenity === 'marketplace') return 'Agricultural Market';
+  if (tags.office === 'agriculture') return 'Agriculture Office';
+  if (tags.amenity === 'veterinary') return 'Veterinary Hospital';
+  if (tags.shop === 'dairy') return 'Dairy Center';
+  if (tags.shop === 'farm') return 'Farm Produce & Supply';
+  if (category === 'mandi') return 'APMC / Market Yard';
+  if (category === 'rsk') return 'Agriculture Department / RSK';
+  if (category === 'kvk') return 'Agri Research / Soil Lab';
+  if (category === 'seeds') return 'Agri Input Store';
+  if (category === 'machinery') return 'Farm Machinery & Tractor';
+  return 'Agricultural Service';
+}
+
+const OVERPASS_ENDPOINTS = [
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+];
+
+type OverpassElement = {
+  type: 'node' | 'way' | 'relation';
+  id: number;
+  lat?: number;
+  lon?: number;
+  center?: { lat?: number; lon?: number };
+  tags?: Record<string, string>;
+};
+
+async function queryOverpassWithFallback(query: string): Promise<{
+  ok: boolean;
+  status: number;
+  elements: OverpassElement[];
+  error?: string;
+}> {
+  const controller = new AbortController();
+  const timeoutTimer = setTimeout(() => controller.abort(), 16000);
+
+  const attemptEndpoint = async (endpoint: string): Promise<OverpassElement[]> => {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'User-Agent': OSM_USER_AGENT,
+        Accept: 'application/json',
+      },
+      body: `data=${encodeURIComponent(query)}`,
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
     }
 
-    const { textQuery, lat, lng, radiusMeters, languageCode } = req.body ?? {};
-    const queryStr = typeof textQuery === 'string' ? textQuery.trim() : '';
-    if (!queryStr) {
+    const json = (await res.json().catch(() => null)) as {
+      elements?: OverpassElement[];
+    } | null;
+
+    if (!json || !Array.isArray(json.elements)) {
+      throw new Error('Invalid Overpass JSON');
+    }
+
+    return json.elements;
+  };
+
+  try {
+    const elements = await Promise.any(OVERPASS_ENDPOINTS.map((ep) => attemptEndpoint(ep)));
+    clearTimeout(timeoutTimer);
+    controller.abort();
+    return { ok: true, status: 200, elements };
+  } catch {
+    clearTimeout(timeoutTimer);
+    return {
+      ok: false,
+      status: 504,
+      elements: [],
+      error: 'OpenStreetMap Overpass mirrors timed out or were busy.',
+    };
+  }
+}
+
+function getNominatimSearchQueriesForCategory(
+  category: string | null,
+  queryList: string[]
+): string[] {
+  switch (category) {
+    case 'mandi':
+      return ['APMC', 'Market Yard', 'Vegetable Market'];
+    case 'rsk':
+      return ['Agriculture Office', 'Raitha Samparka', 'Veterinary'];
+    case 'kvk':
+      return ['Krishi Vigyan', 'Agricultural', 'Soil'];
+    case 'seeds':
+      return ['Agro', 'Fertilizer', 'Nursery'];
+    case 'machinery':
+      return ['Tractor', 'Machinery', 'Irrigation'];
+    default:
+      return queryList.slice(0, 2);
+  }
+}
+
+function isRelevantOsmPlace(opts: {
+  name: string;
+  osmCategory?: string;
+  osmType?: string;
+  tags?: Record<string, string>;
+  category: string | null;
+}): boolean {
+  const nameLower = opts.name.toLowerCase();
+  const cat = (opts.osmCategory || '').toLowerCase();
+  const typ = (opts.osmType || '').toLowerCase();
+  const tags = opts.tags || {};
+
+  if (
+    tags.amenity === 'toilets' ||
+    cat === 'waterway' ||
+    typ === 'canal' ||
+    typ === 'river' ||
+    typ === 'bus_stop' ||
+    cat === 'highway'
+  ) {
+    // Allow named agri campus landmarks only if not purely a road/canal
+    if (cat === 'waterway' || cat === 'highway') return false;
+  }
+
+  if (
+    ['fuel', 'school', 'kindergarten', 'restaurant', 'cafe', 'fast_food', 'bank', 'atm', 'parking', 'place_of_worship'].includes(
+      typ
+    ) ||
+    ['fuel', 'school', 'kindergarten', 'toilets'].includes(tags.amenity || '')
+  ) {
+    return false;
+  }
+
+  if (
+    /\b(petrol|diesel|passport seva|vidya kendra|kalyana kendra|kindergarten|play school|euro kids|hotel|resort|public toilet|bus stop)\b/i.test(
+      opts.name
+    )
+  ) {
+    return false;
+  }
+
+  if (opts.category === 'mandi' && typ === 'attraction' && nameLower === 'market') {
+    return false;
+  }
+
+  if (
+    opts.category === 'kvk' &&
+    (typ === 'school' ||
+      typ === 'kindergarten' ||
+      nameLower.includes('apmc') ||
+      nameLower.includes('market committee'))
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function inferPrimaryTypeFromNominatim(
+  name: string,
+  osmCategory: string,
+  osmType: string,
+  category: string | null
+): string {
+  const tags: Record<string, string> = { name };
+  if (osmCategory === 'amenity') tags.amenity = osmType;
+  if (osmCategory === 'shop') tags.shop = osmType;
+  if (osmCategory === 'office') tags.office = osmType;
+  return formatOsmPrimaryType(tags, category);
+}
+
+async function searchOsmPlacesViaNominatim(opts: {
+  lat: number;
+  lng: number;
+  radiusMeters: number;
+  category: string | null;
+  queryList: string[];
+  lang: SupportedLang;
+}): Promise<{
+  ok: boolean;
+  places: Array<{
+    id: string;
+    name: string;
+    address: string;
+    latitude: number;
+    longitude: number;
+    distanceKm: number;
+    primaryType: string | null;
+    businessStatus: string | null;
+    osmUri: string | null;
+    directionsUri: string | null;
+  }>;
+}> {
+  const { lat, lng, radiusMeters, category, queryList, lang } = opts;
+  const maxDistanceKm = radiusMeters / 1000;
+  const dLat = radiusMeters / 111320;
+  const cosLat = Math.max(0.2, Math.cos((lat * Math.PI) / 180));
+  const dLng = radiusMeters / (111320 * cosLat);
+  const viewbox = `${(lng - dLng).toFixed(5)},${(lat + dLat).toFixed(5)},${(lng + dLng).toFixed(5)},${(lat - dLat).toFixed(5)}`;
+
+  const searchTerms = getNominatimSearchQueriesForCategory(category, queryList);
+  const results: Array<{
+    id: string;
+    name: string;
+    address: string;
+    latitude: number;
+    longitude: number;
+    distanceKm: number;
+    primaryType: string | null;
+    businessStatus: string | null;
+    osmUri: string | null;
+    directionsUri: string | null;
+  }> = [];
+
+  let anySuccess = false;
+
+  for (const term of searchTerms) {
+    try {
+      await waitForNominatimSlot();
+      const url = new URL('https://nominatim.openstreetmap.org/search');
+      url.searchParams.set('format', 'jsonv2');
+      url.searchParams.set('addressdetails', '1');
+      url.searchParams.set('countrycodes', 'in');
+      url.searchParams.set('bounded', '1');
+      url.searchParams.set('viewbox', viewbox);
+      url.searchParams.set('limit', '15');
+      url.searchParams.set('q', term);
+
+      const res = await fetch(url.toString(), {
+        headers: {
+          'User-Agent': OSM_USER_AGENT,
+          'Accept-Language': `${lang},en`,
+        },
+        signal: AbortSignal.timeout(7000),
+      });
+
+      if (!res.ok) continue;
+      anySuccess = true;
+
+      const items = (await res.json().catch(() => [])) as Array<{
+        osm_type?: string;
+        osm_id?: number;
+        lat?: string;
+        lon?: string;
+        name?: string;
+        display_name?: string;
+        category?: string;
+        type?: string;
+        address?: Record<string, string>;
+      }>;
+
+      for (const item of items) {
+        const elLat = Number(item.lat);
+        const elLng = Number(item.lon);
+        if (!Number.isFinite(elLat) || !Number.isFinite(elLng)) continue;
+
+        const name = (item.name || item.display_name?.split(',')[0] || '').trim();
+        if (!name) continue;
+
+        if (
+          !isRelevantOsmPlace({
+            name,
+            osmCategory: item.category,
+            osmType: item.type,
+            category,
+          })
+        ) {
+          continue;
+        }
+
+        const distKm = haversineDistanceKm(lat, lng, elLat, elLng);
+        if (distKm > maxDistanceKm) continue;
+
+        const osmType =
+          item.osm_type === 'way' || item.osm_type === 'relation' || item.osm_type === 'node'
+            ? item.osm_type
+            : 'node';
+        const osmId = item.osm_id || Math.round(Math.abs(elLat * 1e6 + elLng * 1e6));
+
+        results.push({
+          id: `${osmType}-${osmId}`,
+          name,
+          address: item.display_name || `${elLat.toFixed(4)}°N, ${elLng.toFixed(4)}°E`,
+          latitude: elLat,
+          longitude: elLng,
+          distanceKm: Number(distKm.toFixed(1)),
+          primaryType: inferPrimaryTypeFromNominatim(
+            name,
+            item.category || '',
+            item.type || '',
+            category
+          ),
+          businessStatus: 'OPERATIONAL',
+          osmUri: `https://www.openstreetmap.org/${osmType}/${osmId}`,
+          directionsUri: `https://maps.openrouteservice.org/directions?n1=${elLat.toFixed(5)}&n2=${elLng.toFixed(5)}&n3=14&a=${lat.toFixed(5)},${lng.toFixed(5)},${elLat.toFixed(5)},${elLng.toFixed(5)}&b=0&c=0&k1=en-US&k2=km`,
+        });
+      }
+    } catch {
+      // Continue remaining search terms
+    }
+  }
+
+  return { ok: anySuccess, places: results };
+}
+
+// Overpass API + Nominatim Bounded OSM search for nearby Mandis, Raitha Samparka Kendras, KVKs, Soil Labs, Seeds & Tractor Services
+app.post('/api/maps/places', async (req, res) => {
+  try {
+    const { categoryId, textQuery, textQueries, lat, lng, radiusMeters, languageCode } =
+      req.body ?? {};
+    const lang = normalizeLang(languageCode);
+    const queryList: string[] = Array.isArray(textQueries)
+      ? textQueries
+          .filter((q): q is string => typeof q === 'string' && q.trim().length > 0)
+          .map((q) => q.trim())
+          .slice(0, 4)
+      : [];
+    if (queryList.length === 0 && typeof textQuery === 'string' && textQuery.trim()) {
+      queryList.push(textQuery.trim());
+    }
+    if (queryList.length === 0 && !categoryId) {
       return res.status(400).json({ error: 'Search query (textQuery) is required.' });
     }
 
-    const allowedLangs = new Set(['en', 'hi', 'kn']);
-    const safeLang =
-      typeof languageCode === 'string' && allowedLangs.has(languageCode) ? languageCode : 'en';
-
-    const requestBody: Record<string, unknown> = {
-      textQuery: queryStr,
-      languageCode: safeLang,
-      regionCode: 'in',
-      pageSize: 12,
-    };
-
     const parsedLat = Number(lat);
     const parsedLng = Number(lng);
-    if (Number.isFinite(parsedLat) && Number.isFinite(parsedLng)) {
-      const rawRadius = Number(radiusMeters);
-      const clampedRadius = Number.isFinite(rawRadius)
-        ? Math.min(Math.max(rawRadius, 500), 50000)
-        : 25000;
-      requestBody.locationBias = {
-        circle: {
-          center: { latitude: parsedLat, longitude: parsedLng },
-          radius: clampedRadius,
-        },
-      };
+    if (!Number.isFinite(parsedLat) || !Number.isFinite(parsedLng)) {
+      return res.status(400).json({ error: 'Valid latitude and longitude coordinates are required.' });
     }
 
-    const placesRes = await fetch('https://places.googleapis.com/v1/places:searchText', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': apiKey,
-        'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
-        'X-Goog-FieldMask':
-          'places.id,places.displayName,places.formattedAddress,places.location,places.googleMapsUri,places.googleMapsLinks.directionsUri,places.primaryTypeDisplayName,places.businessStatus',
-      },
-      body: JSON.stringify(requestBody),
-    });
+    const rawRadius = Number(radiusMeters);
+    const clampedRadius = Number.isFinite(rawRadius)
+      ? Math.min(Math.max(rawRadius, 1000), 50000)
+      : 25000;
+    const maxDistanceKm = clampedRadius / 1000;
 
-    const placesData = (await placesRes.json().catch(() => ({}))) as {
-      places?: Array<{
-        id?: string;
-        displayName?: { text?: string };
-        formattedAddress?: string;
-        location?: { latitude?: number; longitude?: number };
-        googleMapsUri?: string;
-        googleMapsLinks?: { directionsUri?: string };
-        primaryTypeDisplayName?: { text?: string };
-        businessStatus?: string;
-      }>;
-      error?: { status?: string; message?: string };
+    const category = inferAgriCategory(categoryId, queryList);
+    const cacheKey = `${parsedLat.toFixed(3)}:${parsedLng.toFixed(3)}:${Math.round(clampedRadius)}:${category || queryList.join('|').toLowerCase()}`;
+
+    const cached = overpassCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.json({ places: cached.value, cached: true });
+    }
+
+    const executeSearch = async () => {
+      const overpassQl = buildOverpassQuery({
+        lat: parsedLat,
+        lng: parsedLng,
+        radiusMeters: clampedRadius,
+        category,
+        queryList,
+      });
+
+      const [overpassRes, nominatimRes] = await Promise.all([
+        queryOverpassWithFallback(overpassQl),
+        searchOsmPlacesViaNominatim({
+          lat: parsedLat,
+          lng: parsedLng,
+          radiusMeters: clampedRadius,
+          category,
+          queryList,
+          lang,
+        }),
+      ]);
+
+      if (!overpassRes.ok && !nominatimRes.ok) {
+        return {
+          ok: false as const,
+          status: overpassRes.status || 502,
+          error:
+            overpassRes.error ||
+            'Unable to reach OpenStreetMap services right now. Please retry.',
+        };
+      }
+
+      const deduped = new Map<
+        string,
+        {
+          id: string;
+          name: string;
+          address: string;
+          latitude: number;
+          longitude: number;
+          distanceKm: number;
+          primaryType: string | null;
+          businessStatus: string | null;
+          osmUri: string | null;
+          directionsUri: string | null;
+        }
+      >();
+
+      for (const el of overpassRes.elements) {
+        const elLat = typeof el.lat === 'number' ? el.lat : el.center?.lat;
+        const elLng = typeof el.lon === 'number' ? el.lon : el.center?.lon;
+        if (typeof elLat !== 'number' || typeof elLng !== 'number') continue;
+
+        const tags = el.tags || {};
+        const name = (tags.name || tags['name:en'] || tags.brand || tags.operator || '').trim();
+        if (!name) continue;
+        if (
+          !isRelevantOsmPlace({
+            name,
+            tags,
+            category,
+          })
+        ) {
+          continue;
+        }
+
+        const distKm = haversineDistanceKm(parsedLat, parsedLng, elLat, elLng);
+        if (distKm > maxDistanceKm) continue;
+
+        const dedupeNameKey = `${name.toLowerCase()}@${elLat.toFixed(3)},${elLng.toFixed(3)}`;
+        const id = `${el.type}-${el.id}`;
+        if (deduped.has(dedupeNameKey)) continue;
+
+        deduped.set(dedupeNameKey, {
+          id,
+          name,
+          address: formatOsmAddress(tags, elLat, elLng),
+          latitude: elLat,
+          longitude: elLng,
+          distanceKm: Number(distKm.toFixed(1)),
+          primaryType: formatOsmPrimaryType(tags, category),
+          businessStatus: 'OPERATIONAL',
+          osmUri: `https://www.openstreetmap.org/${el.type}/${el.id}`,
+          directionsUri: `https://maps.openrouteservice.org/directions?n1=${elLat.toFixed(5)}&n2=${elLng.toFixed(5)}&n3=14&a=${parsedLat.toFixed(5)},${parsedLng.toFixed(5)},${elLat.toFixed(5)},${elLng.toFixed(5)}&b=0&c=0&k1=en-US&k2=km`,
+        });
+      }
+
+      for (const item of nominatimRes.places) {
+        const dedupeNameKey = `${item.name.toLowerCase()}@${item.latitude.toFixed(3)},${item.longitude.toFixed(3)}`;
+        if (deduped.has(dedupeNameKey)) continue;
+        deduped.set(dedupeNameKey, item);
+      }
+
+      const normalized = Array.from(deduped.values())
+        .sort((a, b) => a.distanceKm - b.distanceKm)
+        .slice(0, 60);
+
+      overpassCache.set(cacheKey, {
+        expiresAt: Date.now() + OVERPASS_CACHE_TTL_MS,
+        value: normalized,
+      });
+
+      return { ok: true as const, places: normalized };
     };
 
-    const errText = `${placesData?.error?.status || ''} ${placesData?.error?.message || ''}`.toUpperCase();
-    if (
-      placesRes.status === 429 ||
-      errText.includes('RESOURCE_EXHAUSTED') ||
-      errText.includes('OVER_QUERY_LIMIT') ||
-      errText.includes('QUOTA')
-    ) {
-      return res.status(429).json({
-        quotaExceeded: true,
-        error: 'Google Maps Platform quota reached for this demo key.',
+    let task = overpassInFlight.get(cacheKey) as ReturnType<typeof executeSearch> | undefined;
+    if (!task) {
+      task = executeSearch().finally(() => {
+        overpassInFlight.delete(cacheKey);
       });
+      overpassInFlight.set(cacheKey, task);
     }
 
-    if (!placesRes.ok) {
-      return res.status(placesRes.status >= 400 && placesRes.status < 500 ? placesRes.status : 502).json({
-        error: placesData?.error?.message || 'Unable to search nearby agricultural services.',
-      });
+    const result = await task;
+    if (!result.ok) {
+      return res.status(result.status).json({ error: result.error });
     }
 
-    const normalized = (placesData.places ?? [])
-      .filter(
-        (p) =>
-          p?.id &&
-          p?.location &&
-          typeof p.location.latitude === 'number' &&
-          typeof p.location.longitude === 'number'
-      )
-      .map((p) => ({
-        id: p.id!,
-        name: p.displayName?.text || 'Agricultural Service Center',
-        address: p.formattedAddress || 'Address unavailable',
-        latitude: p.location!.latitude!,
-        longitude: p.location!.longitude!,
-        primaryType: p.primaryTypeDisplayName?.text || null,
-        businessStatus: p.businessStatus || null,
-        googleMapsUri: p.googleMapsUri || null,
-        directionsUri: p.googleMapsLinks?.directionsUri || null,
-      }));
-
-    res.json({ places: normalized });
+    res.json({ places: result.places });
   } catch (error) {
-    console.error('Places API proxy error:', error);
+    console.error('Overpass API proxy error:', error);
     res.status(500).json({ error: 'Unable to search nearby places right now.' });
   }
 });
 
-// Weather & Local Forecast via Google Maps Platform (Geocoding v4 + Weather API)
-app.get('/api/weather', async (req, res) => {
+// Driving Directions proxy using OpenRouteService (with public OSRM fallback)
+app.post('/api/maps/directions', async (req, res) => {
   try {
-    const apiKey =
-      process.env.GOOGLE_MAPS_API_KEY ||
-      process.env.VITE_GOOGLE_MAPS_API_KEY ||
-      process.env.MAPS_API_KEY;
+    const { fromLat, fromLng, toLat, toLng } = req.body ?? {};
+    const fLat = Number(fromLat);
+    const fLng = Number(fromLng);
+    const tLat = Number(toLat);
+    const tLng = Number(toLng);
 
-    if (!apiKey) {
-      return res.status(503).json({
-        error: 'Weather service API key is not configured on the server.',
-      });
+    if (
+      !Number.isFinite(fLat) ||
+      !Number.isFinite(fLng) ||
+      !Number.isFinite(tLat) ||
+      !Number.isFinite(tLng)
+    ) {
+      return res.status(400).json({ error: 'Valid origin and destination coordinates are required.' });
     }
 
-    const gmpHeaders = {
-      'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
-    };
+    const cacheKey = `${fLat.toFixed(4)},${fLng.toFixed(4)}->${tLat.toFixed(4)},${tLng.toFixed(4)}`;
+    const cached = directionsCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.json(cached.value);
+    }
 
+    const orsKey = (process.env.OPENROUTESERVICE_API_KEY || process.env.ORS_API_KEY || '').trim();
+    if (orsKey) {
+      try {
+        const orsRes = await fetch(
+          'https://api.openrouteservice.org/v2/directions/driving-car/geojson',
+          {
+            method: 'POST',
+            headers: {
+              Authorization: orsKey,
+              'Content-Type': 'application/json',
+              'User-Agent': OSM_USER_AGENT,
+            },
+            body: JSON.stringify({
+              coordinates: [
+                [fLng, fLat],
+                [tLng, tLat],
+              ],
+            }),
+          }
+        );
+
+        if (orsRes.ok) {
+          const orsJson = (await orsRes.json()) as {
+            features?: Array<{
+              geometry?: { coordinates?: Array<[number, number]> };
+              properties?: { summary?: { distance?: number; duration?: number } };
+            }>;
+          };
+          const feature = orsJson.features?.[0];
+          const coords = feature?.geometry?.coordinates;
+          if (Array.isArray(coords) && coords.length > 0) {
+            const payload = {
+              coordinates: coords.map(([lng, lat]) => [lat, lng] as [number, number]),
+              distanceKm: Number(((feature?.properties?.summary?.distance ?? 0) / 1000).toFixed(1)),
+              durationMin: Math.round((feature?.properties?.summary?.duration ?? 0) / 60),
+              provider: 'OpenRouteService',
+            };
+            directionsCache.set(cacheKey, {
+              expiresAt: Date.now() + DIRECTIONS_CACHE_TTL_MS,
+              value: payload,
+            });
+            return res.json(payload);
+          }
+        }
+      } catch (err) {
+        console.warn('OpenRouteService request failed, falling back to OSRM:', err);
+      }
+    }
+
+    // Fallback to OpenStreetMap OSRM driving router
+    const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${fLng},${fLat};${tLng},${tLat}?overview=full&geometries=geojson`;
+    const osrmRes = await fetch(osrmUrl, {
+      headers: { 'User-Agent': OSM_USER_AGENT },
+    });
+
+    if (osrmRes.ok) {
+      const osrmJson = (await osrmRes.json()) as {
+        routes?: Array<{
+          distance?: number;
+          duration?: number;
+          geometry?: { coordinates?: Array<[number, number]> };
+        }>;
+      };
+      const route = osrmJson.routes?.[0];
+      const coords = route?.geometry?.coordinates;
+      if (Array.isArray(coords) && coords.length > 0) {
+        const payload = {
+          coordinates: coords.map(([lng, lat]) => [lat, lng] as [number, number]),
+          distanceKm: Number(((route?.distance ?? 0) / 1000).toFixed(1)),
+          durationMin: Math.round((route?.duration ?? 0) / 60),
+          provider: 'OpenStreetMap OSRM',
+        };
+        directionsCache.set(cacheKey, {
+          expiresAt: Date.now() + DIRECTIONS_CACHE_TTL_MS,
+          value: payload,
+        });
+        return res.json(payload);
+      }
+    }
+
+    const straightKm = haversineDistanceKm(fLat, fLng, tLat, tLng);
+    return res.json({
+      coordinates: [
+        [fLat, fLng],
+        [tLat, tLng],
+      ],
+      distanceKm: Number(straightKm.toFixed(1)),
+      durationMin: Math.max(1, Math.round((straightKm / 35) * 60)),
+      provider: 'Direct Estimate',
+    });
+  } catch (error) {
+    console.error('Directions API proxy error:', error);
+    res.status(500).json({ error: 'Unable to compute directions right now.' });
+  }
+});
+
+function formatNominatimDisplayName(
+  item: {
+    display_name?: string;
+    name?: string;
+    address?: Record<string, string>;
+  },
+  fallback: string
+): string {
+  const addr = item.address || {};
+  const locality =
+    item.name ||
+    addr.village ||
+    addr.town ||
+    addr.city ||
+    addr.suburb ||
+    addr.hamlet ||
+    addr.county ||
+    '';
+  const district = addr.state_district || addr.county || '';
+  const state = addr.state || '';
+  const country = addr.country || 'India';
+  const parts = [locality, district !== locality ? district : '', state, country]
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  if (parts.length > 0) {
+    return Array.from(new Set(parts)).join(', ');
+  }
+  return item.display_name || fallback;
+}
+
+async function resolveCoordinatesWithNominatim(opts: {
+  locationParam: string;
+  rawLat: number;
+  rawLng: number;
+  lang: SupportedLang;
+}): Promise<
+  | { ok: true; latitude: number; longitude: number; locationName: string }
+  | { ok: false; status: number; error: string }
+> {
+  const { locationParam, rawLat, rawLng, lang } = opts;
+
+  if (Number.isFinite(rawLat) && Number.isFinite(rawLng)) {
+    const revKey = `rev:${rawLat.toFixed(3)},${rawLng.toFixed(3)}:${lang}`;
+    const cached = nominatimCache.get(revKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return { ok: true, ...cached.value };
+    }
+
+    const pending = nominatimInFlight.get(revKey);
+    if (pending) return pending;
+
+    const task = (async () => {
+      await waitForNominatimSlot();
+      let locationName = `${rawLat.toFixed(2)}°N, ${rawLng.toFixed(2)}°E`;
+      const revUrl = new URL('https://nominatim.openstreetmap.org/reverse');
+      revUrl.searchParams.set('format', 'jsonv2');
+      revUrl.searchParams.set('addressdetails', '1');
+      revUrl.searchParams.set('lat', String(rawLat));
+      revUrl.searchParams.set('lon', String(rawLng));
+      revUrl.searchParams.set('zoom', '14');
+
+      const revRes = await fetch(revUrl.toString(), {
+        headers: {
+          'User-Agent': OSM_USER_AGENT,
+          'Accept-Language': `${lang},en`,
+        },
+      });
+      if (revRes.status === 429) {
+        return {
+          ok: false as const,
+          status: 429,
+          error: 'Location lookup rate limit reached. Please wait a second and try again.',
+        };
+      }
+      if (revRes.ok) {
+        const revData = (await revRes.json().catch(() => ({}))) as {
+          display_name?: string;
+          name?: string;
+          address?: Record<string, string>;
+        };
+        if (revData && (revData.display_name || revData.address)) {
+          locationName = formatNominatimDisplayName(revData, locationName);
+        }
+      }
+      const value = { latitude: rawLat, longitude: rawLng, locationName };
+      nominatimCache.set(revKey, { expiresAt: Date.now() + NOMINATIM_CACHE_TTL_MS, value });
+      return { ok: true as const, ...value };
+    })().finally(() => {
+      nominatimInFlight.delete(revKey);
+    });
+
+    nominatimInFlight.set(revKey, task);
+    return task;
+  }
+
+  const normalizedQuery = locationParam.replace(/\s*,\s*/g, ', ').replace(/\s+/g, ' ').trim();
+  const fwdKey = `fwd:${normalizedQuery.toLowerCase()}:${lang}`;
+  const cached = nominatimCache.get(fwdKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { ok: true, ...cached.value };
+  }
+
+  const pending = nominatimInFlight.get(fwdKey);
+  if (pending) return pending;
+
+  const task = (async () => {
+    const queryCandidates = [normalizedQuery];
+    const withoutIndia = normalizedQuery.replace(/,\s*india$/i, '').trim();
+    if (withoutIndia && withoutIndia !== normalizedQuery) {
+      queryCandidates.push(withoutIndia);
+    }
+
+    for (const candidate of queryCandidates) {
+      await waitForNominatimSlot();
+      const url = new URL('https://nominatim.openstreetmap.org/search');
+      url.searchParams.set('format', 'jsonv2');
+      url.searchParams.set('addressdetails', '1');
+      url.searchParams.set('countrycodes', 'in');
+      url.searchParams.set('limit', '5');
+      url.searchParams.set('q', candidate);
+
+      const geoRes = await fetch(url.toString(), {
+        headers: {
+          'User-Agent': OSM_USER_AGENT,
+          'Accept-Language': `${lang},en`,
+        },
+      });
+
+      if (geoRes.status === 429) {
+        return {
+          ok: false as const,
+          status: 429,
+          error: 'Location search rate limit reached. Please wait a moment and try again.',
+        };
+      }
+
+      if (!geoRes.ok) {
+        return {
+          ok: false as const,
+          status: geoRes.status >= 400 && geoRes.status < 500 ? geoRes.status : 502,
+          error: 'Unable to resolve the requested location via Nominatim.',
+        };
+      }
+
+      const results = (await geoRes.json().catch(() => [])) as Array<{
+        lat?: string;
+        lon?: string;
+        display_name?: string;
+        name?: string;
+        category?: string;
+        type?: string;
+        addresstype?: string;
+        importance?: number;
+        address?: Record<string, string>;
+      }>;
+
+      if (Array.isArray(results) && results.length > 0) {
+        const preferred =
+          results.find((r) =>
+            ['city', 'town', 'village', 'suburb', 'hamlet', 'locality'].includes(
+              r.addresstype || r.type || ''
+            )
+          ) ||
+          results.find(
+            (r) =>
+              r.category === 'boundary' ||
+              r.category === 'place' ||
+              ['administrative', 'county', 'state_district', 'state'].includes(
+                r.addresstype || r.type || ''
+              )
+          ) ||
+          results[0];
+
+        const parsedLat = Number(preferred.lat);
+        const parsedLon = Number(preferred.lon);
+        if (Number.isFinite(parsedLat) && Number.isFinite(parsedLon)) {
+          const value = {
+            latitude: parsedLat,
+            longitude: parsedLon,
+            locationName: formatNominatimDisplayName(preferred, normalizedQuery),
+          };
+          nominatimCache.set(fwdKey, {
+            expiresAt: Date.now() + NOMINATIM_CACHE_TTL_MS,
+            value,
+          });
+          return { ok: true as const, ...value };
+        }
+      }
+    }
+
+    return {
+      ok: false as const,
+      status: 404,
+      error: `Location "${locationParam}" was not found. Try entering Village/Town, District, and State (e.g., Haliyal, Karnataka, India).`,
+    };
+  })().finally(() => {
+    nominatimInFlight.delete(fwdKey);
+  });
+
+  nominatimInFlight.set(fwdKey, task);
+  return task;
+}
+
+// Dedicated Nominatim Geocode endpoint
+app.get('/api/maps/geocode', async (req, res) => {
+  try {
     const lang = normalizeLang(req.query.lang);
     const rawLat = req.query.lat !== undefined ? Number(req.query.lat) : NaN;
     const rawLng = req.query.lng !== undefined ? Number(req.query.lng) : NaN;
     const locationParam =
       typeof req.query.location === 'string' && req.query.location.trim()
         ? req.query.location.trim()
-        : 'Bengaluru, Karnataka, India';
+        : '';
 
-    let latitude: number;
-    let longitude: number;
-    let locationName = locationParam;
-
-    const isQuotaPayload = (status: number, body: unknown) => {
-      if (status === 429) return true;
-      const errObj = (body as { error?: { status?: string; message?: string } })?.error;
-      const msg = `${errObj?.status || ''} ${errObj?.message || ''}`.toUpperCase();
-      return msg.includes('RESOURCE_EXHAUSTED') || msg.includes('OVER_QUERY_LIMIT') || msg.includes('QUOTA');
-    };
-
-    if (Number.isFinite(rawLat) && Number.isFinite(rawLng)) {
-      latitude = rawLat;
-      longitude = rawLng;
-      locationName = `${latitude.toFixed(2)}°N, ${longitude.toFixed(2)}°E`;
-
-      // Reverse Geocode v4 for friendly place label
-      const revUrl = new URL('https://geocode.googleapis.com/v4/geocode/location');
-      revUrl.searchParams.set('location.latitude', String(latitude));
-      revUrl.searchParams.set('location.longitude', String(longitude));
-      revUrl.searchParams.set('languageCode', lang);
-
-      const revRes = await fetch(revUrl.toString(), {
-        headers: {
-          ...gmpHeaders,
-          'X-Goog-Api-Key': apiKey,
-          'X-Goog-FieldMask': 'results.placeId,results.formattedAddress',
-        },
-      });
-      const revData = await revRes.json().catch(() => ({}));
-      if (isQuotaPayload(revRes.status, revData)) {
-        return res.status(429).json({
-          quotaExceeded: true,
-          error: 'Google Maps Platform quota reached for this demo key.',
-        });
-      }
-      const formatted = (revData as { results?: Array<{ formattedAddress?: string }> })
-        ?.results?.[0]?.formattedAddress;
-      if (formatted) {
-        locationName = formatted;
-      }
-    } else {
-      // Forward Geocode v4
-      const geoUrl = new URL(
-        `https://geocode.googleapis.com/v4/geocode/address/${encodeURIComponent(locationParam)}`
-      );
-      geoUrl.searchParams.set('regionCode', 'in');
-      geoUrl.searchParams.set('languageCode', lang);
-
-      const geoRes = await fetch(geoUrl.toString(), {
-        headers: {
-          ...gmpHeaders,
-          'X-Goog-Api-Key': apiKey,
-          'X-Goog-FieldMask': 'results.placeId,results.location,results.formattedAddress',
-        },
-      });
-      const geoData = (await geoRes.json().catch(() => ({}))) as {
-        results?: Array<{
-          formattedAddress?: string;
-          location?: { latitude?: number; longitude?: number };
-        }>;
-        error?: { message?: string; status?: string };
-      };
-
-      if (isQuotaPayload(geoRes.status, geoData)) {
-        return res.status(429).json({
-          quotaExceeded: true,
-          error: 'Google Maps Platform quota reached for this demo key.',
-        });
-      }
-
-      if (!geoRes.ok) {
-        return res.status(geoRes.status >= 400 && geoRes.status < 500 ? geoRes.status : 502).json({
-          error: geoData?.error?.message || 'Unable to resolve the requested location.',
-        });
-      }
-
-      const first = geoData.results?.[0];
-      if (!first?.location || first.location.latitude === undefined || first.location.longitude === undefined) {
-        return res.status(404).json({
-          error: `Location "${locationParam}" was not found. Try entering District and State (e.g., Mandya, Karnataka).`,
-        });
-      }
-
-      latitude = first.location.latitude;
-      longitude = first.location.longitude;
-      locationName = first.formattedAddress || locationParam;
+    if (!locationParam && (!Number.isFinite(rawLat) || !Number.isFinite(rawLng))) {
+      return res.status(400).json({ error: 'Please enter a village, town, district, or state name.' });
     }
 
-    const buildWeatherUrl = (endpoint: string, extra: Record<string, string>) => {
-      const u = new URL(`https://weather.googleapis.com/v1/${endpoint}`);
-      u.searchParams.set('key', apiKey);
-      u.searchParams.set('location.latitude', String(latitude));
-      u.searchParams.set('location.longitude', String(longitude));
-      u.searchParams.set('unitsSystem', 'METRIC');
-      for (const [k, v] of Object.entries(extra)) {
-        u.searchParams.set(k, v);
-      }
-      return u.toString();
-    };
-
-    const [currRes, dailyRes, hourlyRes] = await Promise.all([
-      fetch(buildWeatherUrl('currentConditions:lookup', {}), { headers: gmpHeaders }),
-      fetch(buildWeatherUrl('forecast/days:lookup', { days: '5', pageSize: '5' }), { headers: gmpHeaders }),
-      fetch(buildWeatherUrl('forecast/hours:lookup', { hours: '12', pageSize: '12' }), { headers: gmpHeaders }),
-    ]);
-
-    const [currJson, dailyJson, hourlyJson] = await Promise.all([
-      currRes.json().catch(() => ({})),
-      dailyRes.json().catch(() => ({})),
-      hourlyRes.json().catch(() => ({})),
-    ]);
-
-    if (
-      isQuotaPayload(currRes.status, currJson) ||
-      isQuotaPayload(dailyRes.status, dailyJson) ||
-      isQuotaPayload(hourlyRes.status, hourlyJson)
-    ) {
-      return res.status(429).json({
-        quotaExceeded: true,
-        error: 'Google Maps Platform quota reached for this demo key.',
-      });
-    }
-
-    if (!currRes.ok) {
-      const msg = (currJson as { error?: { message?: string } })?.error?.message;
-      return res.status(502).json({
-        error: msg || 'Live weather observations are temporarily unavailable for this coordinate.',
-      });
-    }
-
-    const c = currJson as {
-      currentTime?: string;
-      isDaytime?: boolean;
-      temperature?: { degrees?: number };
-      feelsLikeTemperature?: { degrees?: number };
-      relativeHumidity?: number;
-      uvIndex?: number;
-      cloudCover?: number;
-      thunderstormProbability?: number;
-      precipitation?: {
-        probability?: { percent?: number };
-        qpf?: { quantity?: number };
-      };
-      wind?: {
-        speed?: { value?: number };
-        direction?: { cardinal?: string };
-      };
-      weatherCondition?: {
-        description?: { text?: string };
-        iconBaseUri?: string;
-      };
-    };
-
-    const temperatureC = c.temperature?.degrees ?? null;
-    const feelsLikeC = c.feelsLikeTemperature?.degrees ?? null;
-    const humidity = c.relativeHumidity ?? null;
-    const windSpeedKmh = c.wind?.speed?.value ?? null;
-    const windDirection = (c.wind?.direction?.cardinal || 'CALM').replace(/_/g, ' ');
-    const rainProbability = c.precipitation?.probability?.percent ?? 0;
-    const precipitationMm = c.precipitation?.qpf?.quantity ?? 0;
-    const uvIndex = c.uvIndex ?? null;
-    const cloudCover = c.cloudCover ?? null;
-    const thunderstormProbability = c.thunderstormProbability ?? 0;
-
-    const advisories = buildWeatherAdvisories(
-      {
-        temperatureC,
-        humidity,
-        windSpeedKmh,
-        rainProbability,
-        precipitationMm,
-        uvIndex,
-        thunderstormProbability,
-      },
-      lang
-    );
-
-    const localeTag = lang === 'hi' ? 'hi-IN' : lang === 'kn' ? 'kn-IN' : 'en-IN';
-    const rawHourly = ((hourlyJson as { forecastHours?: unknown[] })?.forecastHours || []) as Array<{
-      displayDateTime?: { hours?: number };
-      temperature?: { degrees?: number };
-      weatherCondition?: { description?: { text?: string }; iconBaseUri?: string };
-      precipitation?: { probability?: { percent?: number } };
-      wind?: { speed?: { value?: number } };
-    }>;
-
-    const hourly = rawHourly.slice(0, 8).map((h) => {
-      const hr = h.displayDateTime?.hours ?? 0;
-      const suffix = hr >= 12 ? 'PM' : 'AM';
-      const hr12 = hr % 12 === 0 ? 12 : hr % 12;
-      return {
-        timeLabel: `${hr12} ${suffix}`,
-        temperatureC: h.temperature?.degrees ?? null,
-        conditionText: h.weatherCondition?.description?.text || 'Clear',
-        iconUri: h.weatherCondition?.iconBaseUri ? `${h.weatherCondition.iconBaseUri}.svg` : null,
-        rainProbability: h.precipitation?.probability?.percent ?? 0,
-        windKmh: h.wind?.speed?.value ?? null,
-      };
+    const geo = await resolveCoordinatesWithNominatim({
+      locationParam,
+      rawLat,
+      rawLng,
+      lang,
     });
 
-    const rawDaily = ((dailyJson as { forecastDays?: unknown[] })?.forecastDays || []) as Array<{
-      displayDate?: { year?: number; month?: number; day?: number };
-      daytimeForecast?: {
-        weatherCondition?: { description?: { text?: string }; iconBaseUri?: string };
-        precipitation?: { probability?: { percent?: number }; qpf?: { quantity?: number } };
-        wind?: { speed?: { value?: number } };
-      };
-      maxTemperature?: { degrees?: number };
-      minTemperature?: { degrees?: number };
-    }>;
+    if (!geo.ok) {
+      return res.status(geo.status).json({ error: geo.error });
+    }
 
-    const daily = rawDaily.slice(0, 5).map((d, idx) => {
-      const yr = d.displayDate?.year || new Date().getFullYear();
-      const mo = (d.displayDate?.month || 1) - 1;
-      const dy = d.displayDate?.day || 1;
-      const dt = new Date(Date.UTC(yr, mo, dy));
-      const dayName =
+    res.json({
+      latitude: geo.latitude,
+      longitude: geo.longitude,
+      locationName: geo.locationName,
+    });
+  } catch (error) {
+    console.error('Nominatim Geocode API error:', error);
+    res.status(500).json({ error: 'Unable to resolve location coordinates right now.' });
+  }
+});
+
+function degreesToCardinal(deg?: number): string {
+  if (typeof deg !== 'number' || !Number.isFinite(deg)) return 'CALM';
+  const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  return dirs[Math.round(((deg % 360) + 360) % 360 / 45) % 8];
+}
+
+async function fetchOpenWeatherReport(opts: {
+  owmKey: string;
+  latitude: number;
+  longitude: number;
+  locationName: string;
+  lang: SupportedLang;
+}) {
+  const { owmKey, latitude, longitude, locationName, lang } = opts;
+  const owmLang = lang === 'hi' ? 'hi' : 'en';
+  const [currRes, fcRes] = await Promise.all([
+    fetch(
+      `https://api.openweathermap.org/data/2.5/weather?lat=${latitude}&lon=${longitude}&units=metric&lang=${owmLang}&appid=${encodeURIComponent(owmKey)}`
+    ),
+    fetch(
+      `https://api.openweathermap.org/data/2.5/forecast?lat=${latitude}&lon=${longitude}&units=metric&lang=${owmLang}&appid=${encodeURIComponent(owmKey)}`
+    ),
+  ]);
+
+  const currJson = (await currRes.json().catch(() => ({}))) as {
+    cod?: number | string;
+    message?: string;
+    dt?: number;
+    sys?: { sunrise?: number; sunset?: number };
+    main?: { temp?: number; feels_like?: number; humidity?: number };
+    wind?: { speed?: number; deg?: number };
+    clouds?: { all?: number };
+    rain?: { '1h'?: number; '3h'?: number };
+    weather?: Array<{ id?: number; main?: string; description?: string; icon?: string }>;
+  };
+  const fcJson = (await fcRes.json().catch(() => ({}))) as {
+    list?: Array<{
+      dt?: number;
+      main?: { temp?: number; temp_max?: number; temp_min?: number };
+      weather?: Array<{ id?: number; description?: string; icon?: string }>;
+      wind?: { speed?: number };
+      pop?: number;
+      rain?: { '3h'?: number };
+    }>;
+  };
+
+  if (!currRes.ok) {
+    return {
+      ok: false as const,
+      status: currRes.status === 401 ? 502 : currRes.status,
+      error: currJson?.message || 'OpenWeatherMap API request failed.',
+    };
+  }
+
+  const temperatureC = currJson.main?.temp ?? null;
+  const feelsLikeC = currJson.main?.feels_like ?? null;
+  const humidity = currJson.main?.humidity ?? null;
+  const windSpeedKmh =
+    typeof currJson.wind?.speed === 'number' ? Math.round(currJson.wind.speed * 3.6) : null;
+  const windDirection = degreesToCardinal(currJson.wind?.deg);
+  const precipitationMm = currJson.rain?.['1h'] ?? currJson.rain?.['3h'] ?? 0;
+  const cloudCover = currJson.clouds?.all ?? null;
+  const firstFcPop = fcJson.list?.[0]?.pop;
+  const rainProbability = typeof firstFcPop === 'number' ? Math.round(firstFcPop * 100) : precipitationMm > 0 ? 60 : 0;
+  const condId = currJson.weather?.[0]?.id ?? 800;
+  const thunderstormProbability = condId >= 200 && condId < 300 ? 75 : 0;
+  const rawDesc = currJson.weather?.[0]?.description || 'Clear';
+  const conditionText = rawDesc.charAt(0).toUpperCase() + rawDesc.slice(1);
+  const iconCode = currJson.weather?.[0]?.icon;
+  const iconUri = iconCode ? `https://openweathermap.org/img/wn/${iconCode}@2x.png` : null;
+  const nowSec = currJson.dt ?? Math.floor(Date.now() / 1000);
+  const isDaytime =
+    currJson.sys?.sunrise && currJson.sys?.sunset
+      ? nowSec >= currJson.sys.sunrise && nowSec <= currJson.sys.sunset
+      : true;
+
+  const advisories = buildWeatherAdvisories(
+    {
+      temperatureC,
+      humidity,
+      windSpeedKmh,
+      rainProbability,
+      precipitationMm,
+      uvIndex: null,
+      thunderstormProbability,
+    },
+    lang
+  );
+
+  const localeTag = lang === 'hi' ? 'hi-IN' : lang === 'kn' ? 'kn-IN' : 'en-IN';
+  const list = Array.isArray(fcJson.list) ? fcJson.list : [];
+
+  const hourly = list.slice(0, 8).map((item) => {
+    const dt = new Date((item.dt ?? 0) * 1000);
+    const hr = dt.getUTCHours();
+    const suffix = hr >= 12 ? 'PM' : 'AM';
+    const hr12 = hr % 12 === 0 ? 12 : hr % 12;
+    const desc = item.weather?.[0]?.description || 'Clear';
+    return {
+      timeLabel: `${hr12} ${suffix}`,
+      temperatureC: item.main?.temp ?? null,
+      conditionText: desc.charAt(0).toUpperCase() + desc.slice(1),
+      iconUri: item.weather?.[0]?.icon
+        ? `https://openweathermap.org/img/wn/${item.weather[0].icon}@2x.png`
+        : null,
+      rainProbability: typeof item.pop === 'number' ? Math.round(item.pop * 100) : 0,
+      windKmh: typeof item.wind?.speed === 'number' ? Math.round(item.wind.speed * 3.6) : null,
+    };
+  });
+
+  const dayMap = new Map<
+    string,
+    {
+      dt: Date;
+      maxTemps: number[];
+      minTemps: number[];
+      pops: number[];
+      rainMms: number[];
+      winds: number[];
+      conditionText: string;
+      iconUri: string | null;
+    }
+  >();
+
+  for (const item of list) {
+    if (!item.dt) continue;
+    const dt = new Date(item.dt * 1000);
+    const key = dt.toISOString().slice(0, 10);
+    const entry = dayMap.get(key) || {
+      dt,
+      maxTemps: [],
+      minTemps: [],
+      pops: [],
+      rainMms: [],
+      winds: [],
+      conditionText: 'Fair',
+      iconUri: null,
+    };
+    if (typeof item.main?.temp_max === 'number') entry.maxTemps.push(item.main.temp_max);
+    if (typeof item.main?.temp_min === 'number') entry.minTemps.push(item.main.temp_min);
+    if (typeof item.pop === 'number') entry.pops.push(Math.round(item.pop * 100));
+    if (typeof item.rain?.['3h'] === 'number') entry.rainMms.push(item.rain['3h']);
+    if (typeof item.wind?.speed === 'number') entry.winds.push(Math.round(item.wind.speed * 3.6));
+    if (item.weather?.[0]?.description && (dt.getUTCHours() === 12 || entry.conditionText === 'Fair')) {
+      const desc = item.weather[0].description;
+      entry.conditionText = desc.charAt(0).toUpperCase() + desc.slice(1);
+      entry.iconUri = item.weather[0].icon
+        ? `https://openweathermap.org/img/wn/${item.weather[0].icon}@2x.png`
+        : entry.iconUri;
+    }
+    dayMap.set(key, entry);
+  }
+
+  const daily = Array.from(dayMap.values())
+    .slice(0, 5)
+    .map((d, idx) => ({
+      dateLabel: d.dt.toLocaleDateString(localeTag, {
+        day: 'numeric',
+        month: 'short',
+        timeZone: 'UTC',
+      }),
+      dayName:
         idx === 0
           ? lang === 'hi'
             ? 'आज'
             : lang === 'kn'
             ? 'ಇಂದು'
             : 'Today'
-          : dt.toLocaleDateString(localeTag, { weekday: 'short', timeZone: 'UTC' });
-      const dateLabel = dt.toLocaleDateString(localeTag, {
-        day: 'numeric',
-        month: 'short',
-        timeZone: 'UTC',
-      });
+          : d.dt.toLocaleDateString(localeTag, { weekday: 'short', timeZone: 'UTC' }),
+      conditionText: d.conditionText,
+      iconUri: d.iconUri,
+      maxTempC: d.maxTemps.length ? Math.max(...d.maxTemps) : null,
+      minTempC: d.minTemps.length ? Math.min(...d.minTemps) : null,
+      rainProbability: d.pops.length ? Math.max(...d.pops) : 0,
+      precipitationMm: Number(d.rainMms.reduce((a, b) => a + b, 0).toFixed(1)),
+      windKmh: d.winds.length ? Math.round(d.winds.reduce((a, b) => a + b, 0) / d.winds.length) : null,
+    }));
 
-      return {
-        dateLabel,
-        dayName,
-        conditionText: d.daytimeForecast?.weatherCondition?.description?.text || 'Fair',
-        iconUri: d.daytimeForecast?.weatherCondition?.iconBaseUri
-          ? `${d.daytimeForecast.weatherCondition.iconBaseUri}.svg`
-          : null,
-        maxTempC: d.maxTemperature?.degrees ?? null,
-        minTempC: d.minTemperature?.degrees ?? null,
-        rainProbability: d.daytimeForecast?.precipitation?.probability?.percent ?? 0,
-        precipitationMm: d.daytimeForecast?.precipitation?.qpf?.quantity ?? 0,
-        windKmh: d.daytimeForecast?.wind?.speed?.value ?? null,
-      };
-    });
-
-    res.json({
+  return {
+    ok: true as const,
+    report: {
       locationName,
       latitude,
       longitude,
-      observedAt: c.currentTime || new Date().toISOString(),
-      isDaytime: c.isDaytime ?? true,
+      observedAt: new Date(nowSec * 1000).toISOString(),
+      isDaytime,
+      current: {
+        temperatureC,
+        feelsLikeC,
+        humidity,
+        windSpeedKmh,
+        windDirection,
+        rainProbability,
+        precipitationMm,
+        uvIndex: null,
+        cloudCover,
+        thunderstormProbability,
+        conditionText,
+        iconUri,
+      },
+      advisories,
+      hourly,
+      daily,
+    },
+  };
+}
+
+function describeWmoWeatherCode(code?: number): string {
+  if (code === undefined || code === null) return 'Clear';
+  if (code === 0) return 'Clear sky';
+  if (code === 1) return 'Mainly clear';
+  if (code === 2) return 'Partly cloudy';
+  if (code === 3) return 'Overcast';
+  if (code === 45 || code === 48) return 'Foggy';
+  if (code >= 51 && code <= 55) return 'Drizzle';
+  if (code >= 61 && code <= 65) return 'Rain';
+  if (code >= 80 && code <= 82) return 'Rain showers';
+  if (code >= 95) return 'Thunderstorm';
+  return 'Fair';
+}
+
+async function fetchOpenMeteoReport(opts: {
+  latitude: number;
+  longitude: number;
+  locationName: string;
+  lang: SupportedLang;
+}) {
+  const { latitude, longitude, locationName, lang } = opts;
+  const url = new URL('https://api.open-meteo.com/v1/forecast');
+  url.searchParams.set('latitude', String(latitude));
+  url.searchParams.set('longitude', String(longitude));
+  url.searchParams.set(
+    'current',
+    'temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,cloud_cover,wind_speed_10m,wind_direction_10m'
+  );
+  url.searchParams.set(
+    'hourly',
+    'temperature_2m,precipitation_probability,weather_code,wind_speed_10m'
+  );
+  url.searchParams.set(
+    'daily',
+    'weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,uv_index_max'
+  );
+  url.searchParams.set('timezone', 'Asia/Kolkata');
+  url.searchParams.set('forecast_days', '5');
+
+  const res = await fetch(url.toString(), {
+    headers: { 'User-Agent': OSM_USER_AGENT },
+  });
+  if (!res.ok) {
+    return {
+      ok: false as const,
+      status: res.status,
+      error: 'Unable to fetch local weather observations right now.',
+    };
+  }
+
+  const data = (await res.json().catch(() => ({}))) as {
+    current?: {
+      time?: string;
+      temperature_2m?: number;
+      relative_humidity_2m?: number;
+      apparent_temperature?: number;
+      is_day?: number;
+      precipitation?: number;
+      weather_code?: number;
+      cloud_cover?: number;
+      wind_speed_10m?: number;
+      wind_direction_10m?: number;
+    };
+    hourly?: {
+      time?: string[];
+      temperature_2m?: number[];
+      precipitation_probability?: number[];
+      weather_code?: number[];
+      wind_speed_10m?: number[];
+    };
+    daily?: {
+      time?: string[];
+      weather_code?: number[];
+      temperature_2m_max?: number[];
+      temperature_2m_min?: number[];
+      precipitation_sum?: number[];
+      precipitation_probability_max?: number[];
+      wind_speed_10m_max?: number[];
+      uv_index_max?: number[];
+    };
+  };
+
+  const c = data.current || {};
+  const temperatureC = typeof c.temperature_2m === 'number' ? c.temperature_2m : null;
+  const feelsLikeC = typeof c.apparent_temperature === 'number' ? c.apparent_temperature : null;
+  const humidity = typeof c.relative_humidity_2m === 'number' ? c.relative_humidity_2m : null;
+  const windSpeedKmh = typeof c.wind_speed_10m === 'number' ? Math.round(c.wind_speed_10m) : null;
+  const windDirection = degreesToCardinal(c.wind_direction_10m);
+  const precipitationMm = typeof c.precipitation === 'number' ? c.precipitation : 0;
+  const cloudCover = typeof c.cloud_cover === 'number' ? c.cloud_cover : null;
+  const rainProbability = data.hourly?.precipitation_probability?.[0] ?? (precipitationMm > 0 ? 60 : 0);
+  const uvIndex = typeof data.daily?.uv_index_max?.[0] === 'number' ? data.daily.uv_index_max[0] : null;
+  const thunderstormProbability = (c.weather_code ?? 0) >= 95 ? 75 : 0;
+  const conditionText = describeWmoWeatherCode(c.weather_code);
+  const isDaytime = c.is_day !== 0;
+
+  const advisories = buildWeatherAdvisories(
+    {
+      temperatureC,
+      humidity,
+      windSpeedKmh,
+      rainProbability,
+      precipitationMm,
+      uvIndex,
+      thunderstormProbability,
+    },
+    lang
+  );
+
+  const nowMs = Date.now();
+  const hTimes = data.hourly?.time || [];
+  let startIdx = hTimes.findIndex((t) => new Date(t).getTime() >= nowMs);
+  if (startIdx < 0) startIdx = 0;
+
+  const hourly = hTimes.slice(startIdx, startIdx + 8).map((tStr, offset) => {
+    const idx = startIdx + offset;
+    const hrMatch = /T(\d{2}):/.exec(tStr);
+    const hr = hrMatch ? Number(hrMatch[1]) : 0;
+    const suffix = hr >= 12 ? 'PM' : 'AM';
+    const hr12 = hr % 12 === 0 ? 12 : hr % 12;
+    return {
+      timeLabel: `${hr12} ${suffix}`,
+      temperatureC: data.hourly?.temperature_2m?.[idx] ?? null,
+      conditionText: describeWmoWeatherCode(data.hourly?.weather_code?.[idx]),
+      iconUri: null,
+      rainProbability: data.hourly?.precipitation_probability?.[idx] ?? 0,
+      windKmh:
+        typeof data.hourly?.wind_speed_10m?.[idx] === 'number'
+          ? Math.round(data.hourly.wind_speed_10m[idx])
+          : null,
+    };
+  });
+
+  const localeTag = lang === 'hi' ? 'hi-IN' : lang === 'kn' ? 'kn-IN' : 'en-IN';
+  const dTimes = data.daily?.time || [];
+  const daily = dTimes.slice(0, 5).map((dStr, idx) => {
+    const dt = new Date(`${dStr}T00:00:00Z`);
+    const dayName =
+      idx === 0
+        ? lang === 'hi'
+          ? 'आज'
+          : lang === 'kn'
+          ? 'ಇಂದು'
+          : 'Today'
+        : dt.toLocaleDateString(localeTag, { weekday: 'short', timeZone: 'UTC' });
+    const dateLabel = dt.toLocaleDateString(localeTag, {
+      day: 'numeric',
+      month: 'short',
+      timeZone: 'UTC',
+    });
+
+    return {
+      dateLabel,
+      dayName,
+      conditionText: describeWmoWeatherCode(data.daily?.weather_code?.[idx]),
+      iconUri: null,
+      maxTempC: data.daily?.temperature_2m_max?.[idx] ?? null,
+      minTempC: data.daily?.temperature_2m_min?.[idx] ?? null,
+      rainProbability: data.daily?.precipitation_probability_max?.[idx] ?? 0,
+      precipitationMm: Number((data.daily?.precipitation_sum?.[idx] ?? 0).toFixed(1)),
+      windKmh:
+        typeof data.daily?.wind_speed_10m_max?.[idx] === 'number'
+          ? Math.round(data.daily.wind_speed_10m_max[idx])
+          : null,
+    };
+  });
+
+  return {
+    ok: true as const,
+    report: {
+      locationName,
+      latitude,
+      longitude,
+      observedAt: new Date().toISOString(),
+      isDaytime,
       current: {
         temperatureC,
         feelsLikeC,
@@ -1689,13 +2738,67 @@ app.get('/api/weather', async (req, res) => {
         uvIndex,
         cloudCover,
         thunderstormProbability,
-        conditionText: c.weatherCondition?.description?.text || 'Clear',
-        iconUri: c.weatherCondition?.iconBaseUri ? `${c.weatherCondition.iconBaseUri}.svg` : null,
+        conditionText,
+        iconUri: null,
       },
       advisories,
       hourly,
       daily,
+    },
+  };
+}
+
+// Weather & Local Forecast via Nominatim Geocoding + OpenWeatherMap / Open-Meteo
+app.get('/api/weather', async (req, res) => {
+  try {
+    const owmKey = process.env.OPENWEATHER_API_KEY?.trim();
+    const lang = normalizeLang(req.query.lang);
+    const rawLat = req.query.lat !== undefined ? Number(req.query.lat) : NaN;
+    const rawLng = req.query.lng !== undefined ? Number(req.query.lng) : NaN;
+    const passedLocationName =
+      typeof req.query.locationName === 'string' ? req.query.locationName.trim() : '';
+    const locationParam =
+      typeof req.query.location === 'string' && req.query.location.trim()
+        ? req.query.location.trim()
+        : 'Bengaluru, Karnataka, India';
+
+    const geo =
+      Number.isFinite(rawLat) && Number.isFinite(rawLng) && passedLocationName
+        ? { ok: true as const, latitude: rawLat, longitude: rawLng, locationName: passedLocationName }
+        : await resolveCoordinatesWithNominatim({
+            locationParam,
+            rawLat,
+            rawLng,
+            lang,
+          });
+
+    if (!geo.ok) {
+      return res.status(geo.status).json({ error: geo.error });
+    }
+
+    if (owmKey) {
+      const owmResult = await fetchOpenWeatherReport({
+        owmKey,
+        latitude: geo.latitude,
+        longitude: geo.longitude,
+        locationName: geo.locationName,
+        lang,
+      });
+      if (owmResult.ok) {
+        return res.json(owmResult.report);
+      }
+    }
+
+    const meteoResult = await fetchOpenMeteoReport({
+      latitude: geo.latitude,
+      longitude: geo.longitude,
+      locationName: geo.locationName,
+      lang,
     });
+    if (!meteoResult.ok) {
+      return res.status(meteoResult.status).json({ error: meteoResult.error });
+    }
+    return res.json(meteoResult.report);
   } catch (error) {
     console.error('Weather API proxy error:', error);
     res.status(500).json({ error: 'Unable to fetch local weather forecast right now.' });
@@ -1755,17 +2858,17 @@ const SITE_PAGES_CATALOG = [
   },
   {
     title: 'Farmer Dashboard & Real-Time Weather Planner',
-    description: 'Manage Farmer Profile, view Personalized Recommendations, Recently Viewed Schemes, Farm Location Map, and Local Google Weather + Daily Spraying/Irrigation/Harvest advisories.',
+    description: 'Manage Farmer Profile, view Personalized Recommendations, Recently Viewed Schemes, Farm Location Map, and Local Weather + Daily Spraying/Irrigation/Harvest advisories.',
     path: '/dashboard',
     category: 'Dashboard & Weather',
     keywords: 'dashboard profile recommendations weather forecast rain humidity wind gps spraying irrigation harvest map',
   },
   {
     title: 'Agri Map & Nearby Services Locator',
-    description: 'Interactive Google Map to discover nearby APMC Mandis, Raitha Samparka Kendras, Krishi Vigyan Kendras, Soil Testing Labs, Seed Stores, Tractor Dealers, and Veterinary Centers.',
+    description: 'Interactive OpenStreetMap locator to discover nearby APMC Mandis, Raitha Samparka Kendras, Krishi Vigyan Kendras, Soil Testing Labs, Seed Stores, Tractor Dealers, and Veterinary Centers.',
     path: '/agri-map',
     category: 'Maps & Nearby Services',
-    keywords: 'map google maps nearby agri center mandi apmc soil lab kvk raitha samparka seed fertilizer tractor veterinary',
+    keywords: 'map openstreetmap leaflet nominatim overpass nearby agri center mandi apmc soil lab kvk raitha samparka seed fertilizer tractor veterinary',
   },
   {
     title: 'Crops Information (32 Varieties)',

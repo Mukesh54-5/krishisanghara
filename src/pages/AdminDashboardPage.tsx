@@ -20,7 +20,7 @@ interface AdminFarmerRow {
 }
 
 interface AdminInquiryRow {
-  id: number;
+  id: number | string;
   name: string;
   email: string;
   phone?: string | null;

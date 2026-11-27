@@ -2,7 +2,7 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
-import React, { useEffect, useState } from 'react';
+import React, { Component, useEffect } from 'react';
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { AuthProvider } from './context/AuthContext';
@@ -23,9 +23,46 @@ import { AboutPage } from './pages/AboutPage';
 import { ContactPage } from './pages/ContactPage';
 import { AgriMapPage } from './pages/AgriMapPage';
 
+interface ErrorBoundaryState {
+  hasError: boolean;
+  message: string;
+}
+
+class AppErrorBoundary extends Component<{ children: React.ReactNode }, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { hasError: false, message: '' };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, message: error.message || 'Unexpected application error.' };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('Application ErrorBoundary caught:', error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-[#F5F8F5] flex items-center justify-center p-6">
+          <div className="max-w-md w-full bg-white border border-[#E5E7EB] rounded-xl p-6 text-center space-y-3">
+            <h1 className="text-lg font-bold text-[#17613A]">Something went wrong</h1>
+            <p className="text-xs text-[#303030]/80 break-words">{this.state.message}</p>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="px-4 py-2 bg-[#17613A] hover:bg-[#207747] text-white text-sm font-semibold rounded"
+            >
+              Reload Page
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   const { t, i18n } = useTranslation();
-  const [gmpQuotaExceeded, setGmpQuotaExceeded] = useState(false);
 
   useEffect(() => {
     const lang = getNormalizedLang(i18n.language);
@@ -33,41 +70,10 @@ export default function App() {
     document.title = t('header.title');
   }, [i18n.language, t]);
 
-  useEffect(() => {
-    const handleQuotaExceeded = () => setGmpQuotaExceeded(true);
-    window.addEventListener('gmp-quota-exceeded', handleQuotaExceeded);
-    return () => window.removeEventListener('gmp-quota-exceeded', handleQuotaExceeded);
-  }, []);
-
   return (
-    <AuthProvider>
+    <AppErrorBoundary>
+      <AuthProvider>
       <DynamicTranslationProvider>
-        {gmpQuotaExceeded && (
-          <div
-            role="alert"
-            className="bg-amber-50 border-b border-amber-200 text-amber-900 px-4 py-2.5 text-xs md:text-sm text-center sticky top-0 z-50 shadow-sm flex items-center justify-center gap-4"
-          >
-            <span>
-              {t('common.quotaBannerBeforeLink')}{' '}
-              <a
-                href="https://developers.google.com/maps/ai/ai-studio?utm_campaign=gmp_mcp_codeassist_v1_aistudio#quota_exceeded_errors"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="underline font-semibold text-amber-950 hover:text-amber-800"
-              >
-                {t('common.quotaBannerLinkText')}
-              </a>{' '}
-              {t('common.quotaBannerAfterLink')}
-            </span>
-            <button
-              type="button"
-              onClick={() => setGmpQuotaExceeded(false)}
-              className="px-2.5 py-1 text-xs font-semibold border border-amber-400 rounded hover:bg-amber-100 shrink-0"
-            >
-              {t('common.dismiss')}
-            </button>
-          </div>
-        )}
         <BrowserRouter>
         <Routes>
           <Route
@@ -193,6 +199,7 @@ export default function App() {
         </Routes>
       </BrowserRouter>
       </DynamicTranslationProvider>
-    </AuthProvider>
+      </AuthProvider>
+    </AppErrorBoundary>
   );
 }

@@ -202,9 +202,18 @@ export interface AgriPlaceItem {
   address: string;
   latitude: number;
   longitude: number;
+  distanceKm?: number | null;
   primaryType?: string | null;
   businessStatus?: string | null;
-  googleMapsUri?: string | null;
+  osmUri?: string | null;
   directionsUri?: string | null;
+}
+
+export interface RouteInfo {
+  coordinates: Array<[number, number]>;
+  distanceKm: number;
+  durationMin: number;
+  provider: string;
+  steps?: Array<{ instruction: string; distanceMeters: number }>;
 }
 

@@ -1,0 +1,258 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isVerified() && (
+        request.auth.token.email == 'mukeshghanchi500@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function hasParentUser(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId))
+        || existsAfter(/databases/$(database)/documents/users/$(userId));
+    }
+
+    function isValidOptionalString(data, key, maxLen) {
+      return !(key in data) || (data[key] is string && data[key].size() <= maxLen);
+    }
+
+    function isValidUserAccount(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'fullName', 'role', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'fullName', 'role', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == userId
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+        && data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120
+        && data.role in ['farmer', 'admin']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFarmerProfile(data, userId) {
+      return data.keys().hasAll(['userId', 'fullName', 'updatedAt'])
+        && data.keys().hasOnly([
+          'userId',
+          'fullName',
+          'age',
+          'gender',
+          'state',
+          'district',
+          'village',
+          'farmerCategory',
+          'landHoldingAcres',
+          'mainCrop',
+          'irrigationAvailability',
+          'farmingType',
+          'mobileNumber',
+          'updatedAt'
+        ])
+        && isValidId(data.userId)
+        && data.userId == userId
+        && data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 120
+        && (!('age' in data) || (data.age is int && data.age >= 18 && data.age <= 110))
+        && isValidOptionalString(data, 'gender', 32)
+        && isValidOptionalString(data, 'state', 80)
+        && isValidOptionalString(data, 'district', 80)
+        && isValidOptionalString(data, 'village', 80)
+        && isValidOptionalString(data, 'farmerCategory', 64)
+        && isValidOptionalString(data, 'landHoldingAcres', 24)
+        && isValidOptionalString(data, 'mainCrop', 80)
+        && isValidOptionalString(data, 'irrigationAvailability', 80)
+        && isValidOptionalString(data, 'farmingType', 80)
+        && isValidOptionalString(data, 'mobileNumber', 20)
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidRecentlyViewed(data, userId, schemeSlug) {
+      return data.keys().hasAll(['userId', 'schemeId', 'slug', 'shortName', 'governmentLevel', 'viewedAt'])
+        && data.keys().hasOnly(['userId', 'schemeId', 'slug', 'shortName', 'governmentLevel', 'viewedAt'])
+        && isValidId(data.userId)
+        && data.userId == userId
+        && data.schemeId is int && data.schemeId >= 1
+        && isValidId(data.slug)
+        && data.slug == schemeSlug
+        && data.shortName is string && data.shortName.size() >= 1 && data.shortName.size() <= 120
+        && data.governmentLevel is string && data.governmentLevel.size() >= 1 && data.governmentLevel.size() <= 32
+        && data.viewedAt is timestamp;
+    }
+
+    function isValidContactMessage(data) {
+      return data.keys().hasAll(['senderUid', 'name', 'email', 'subject', 'message', 'status', 'createdAt'])
+        && data.keys().hasOnly(['senderUid', 'name', 'email', 'phone', 'subject', 'message', 'status', 'createdAt'])
+        && isValidId(data.senderUid)
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 120
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+        && isValidOptionalString(data, 'phone', 24)
+        && data.subject is string && data.subject.size() >= 2 && data.subject.size() <= 200
+        && data.message is string && data.message.size() >= 5 && data.message.size() <= 2000
+        && data.status in ['new', 'reviewed']
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAdminMarker(data, adminUid) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'email', 'createdAt'])
+        && isValidId(data.uid)
+        && data.uid == adminUid
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+        && data.createdAt is timestamp;
+    }
+
+    // Bootstrapped & designated admins registry
+    match /admins/{adminUid} {
+      allow get: if isValidId(adminUid) && isAdmin();
+      allow list: if isAdmin();
+      allow create: if isValidId(adminUid)
+        && isAdmin()
+        && isValidAdminMarker(incoming(), adminUid)
+        && incoming().createdAt == request.time;
+      allow update: if isValidId(adminUid)
+        && isAdmin()
+        && isValidAdminMarker(incoming(), adminUid)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email']);
+      allow delete: if isValidId(adminUid) && isAdmin();
+    }
+
+    // User account documents (PII protected)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId)
+        && isVerified()
+        && isOwner(userId)
+        && isValidUserAccount(incoming(), userId)
+        && incoming().role == 'farmer'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isVerified()
+        && isValidUserAccount(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'email', 'role', 'updatedAt'])) ||
+          (isOwner(userId) && incoming().role == existing().role && incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'email', 'updatedAt']))
+        );
+      allow delete: if isValidId(userId) && isAdmin();
+
+      // Isolated private farmer profile subcollection
+      match /private/{profileId} {
+        allow get: if isValidId(userId) && profileId == 'profile' && (isOwner(userId) || isAdmin());
+        allow list: if false;
+        allow create: if isValidId(userId)
+          && profileId == 'profile'
+          && isVerified()
+          && isOwner(userId)
+          && isValidFarmerProfile(incoming(), userId)
+          && incoming().updatedAt == request.time
+          && hasParentUser(userId);
+        allow update: if isValidId(userId)
+          && profileId == 'profile'
+          && isVerified()
+          && isOwner(userId)
+          && isValidFarmerProfile(incoming(), userId)
+          && incoming().userId == existing().userId
+          && incoming().updatedAt == request.time
+          && hasParentUser(userId)
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'fullName',
+            'age',
+            'gender',
+            'state',
+            'district',
+            'village',
+            'farmerCategory',
+            'landHoldingAcres',
+            'mainCrop',
+            'irrigationAvailability',
+            'farmingType',
+            'mobileNumber',
+            'updatedAt'
+          ]);
+        allow delete: if isValidId(userId) && profileId == 'profile' && (isOwner(userId) || isAdmin());
+      }
+
+      // Recently viewed schemes subcollection
+      match /recentlyViewed/{schemeSlug} {
+        allow get: if isValidId(userId) && isValidId(schemeSlug) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && (isOwner(userId) || isAdmin());
+        allow create: if isValidId(userId)
+          && isValidId(schemeSlug)
+          && isVerified()
+          && isOwner(userId)
+          && isValidRecentlyViewed(incoming(), userId, schemeSlug)
+          && incoming().viewedAt == request.time
+          && hasParentUser(userId);
+        allow update: if isValidId(userId)
+          && isValidId(schemeSlug)
+          && isVerified()
+          && isOwner(userId)
+          && isValidRecentlyViewed(incoming(), userId, schemeSlug)
+          && incoming().userId == existing().userId
+          && incoming().slug == existing().slug
+          && incoming().viewedAt == request.time
+          && hasParentUser(userId)
+          && incoming().diff(existing()).affectedKeys().hasOnly(['schemeId', 'shortName', 'governmentLevel', 'viewedAt']);
+        allow delete: if isValidId(userId) && isValidId(schemeSlug) && (isOwner(userId) || isAdmin());
+      }
+    }
+
+    // Contact inquiry messages (owner + admin access only)
+    match /contactMessages/{messageId} {
+      allow get: if isValidId(messageId)
+        && ((isSignedIn() && existing().senderUid == request.auth.uid) || isAdmin());
+      allow list: if (isSignedIn() && resource.data.senderUid == request.auth.uid) || isAdmin();
+      allow create: if isValidId(messageId)
+        && isVerified()
+        && isValidContactMessage(incoming())
+        && incoming().senderUid == request.auth.uid
+        && incoming().status == 'new'
+        && incoming().createdAt == request.time;
+      allow update: if isValidId(messageId)
+        && isVerified()
+        && isValidContactMessage(incoming())
+        && incoming().senderUid == existing().senderUid
+        && incoming().createdAt == existing().createdAt
+        && (existing().status == 'new' || isAdmin())
+        && (
+          isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['status'])
+        );
+      allow delete: if isValidId(messageId) && isAdmin();
+    }
+  }
+}

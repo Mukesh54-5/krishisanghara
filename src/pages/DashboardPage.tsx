@@ -146,22 +146,20 @@ export const DashboardPage: React.FC = () => {
     setSaveMsg(null);
     setSaveErr(null);
     try {
-      const updated = await updateFarmerProfile(
-        {
-          fullName,
-          age: age ? Number(age) : null,
-          gender,
-          state,
-          district,
-          village,
-          farmerCategory,
-          landHoldingAcres,
-          mainCrop,
-          irrigationAvailability,
-          farmingType,
-        },
-        token
-      );
+      const profilePayload = {
+        fullName,
+        age: age ? Number(age) : null,
+        gender,
+        state,
+        district,
+        village,
+        farmerCategory,
+        landHoldingAcres,
+        mainCrop,
+        irrigationAvailability,
+        farmingType,
+      };
+      const updated = await updateFarmerProfile(profilePayload, token);
       setProfileState(updated);
       setSaveMsg(t('dashboard.profileSavedMsg'));
       await loadData(token);

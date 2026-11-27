@@ -2,10 +2,23 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
 import * as schema from './schema.ts';
 import { createMockDb } from './mockDb.ts';
+import { createSupabaseDb } from './supabaseDb.ts';
 
 declare global {
   var _postgresPool: Pool | undefined;
 }
+
+const supabaseUrl = (
+  process.env.SUPABASE_URL ||
+  process.env.VITE_SUPABASE_URL ||
+  ''
+).trim();
+const supabaseKey = (
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.VITE_SUPABASE_ANON_KEY ||
+  ''
+).trim();
 
 const connectionString = process.env.DATABASE_URL || process.env.POSTGRES_URL;
 
@@ -50,13 +63,18 @@ export const createPool = () => {
 };
 
 let db: ReturnType<typeof drizzle<typeof schema>>;
-const pool = createPool();
 
-if (pool) {
-  db = drizzle(pool, { schema });
+if (supabaseUrl && supabaseKey) {
+  console.log('[DB] Using Supabase HTTPS client');
+  db = createSupabaseDb(supabaseUrl, supabaseKey);
 } else {
-  console.warn('[AI Studio] Database not configured — using in-memory store with seeded data');
-  db = createMockDb();
+  const pool = createPool();
+  if (pool) {
+    db = drizzle(pool, { schema });
+  } else {
+    console.warn('[AI Studio] Database not configured — using in-memory store with seeded data');
+    db = createMockDb();
+  }
 }
 
 export { db };

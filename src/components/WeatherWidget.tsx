@@ -17,7 +17,7 @@ import {
   CheckCircle2,
   Clock,
 } from 'lucide-react';
-import { fetchWeather, getGoogleMapsApiKey } from '../services/api';
+import { fetchWeather } from '../services/api';
 import { useTranslatedTexts } from '../context/DynamicTranslationContext';
 import { getNormalizedLang } from '../translations/i18n';
 import { AgriServicesMap } from './AgriServicesMap';
@@ -63,17 +63,12 @@ export const WeatherWidget: React.FC<WeatherWidgetProps> = ({
   const currentLang = getNormalizedLang(i18n.language);
   const [queryInput, setQueryInput] = useState(defaultLocation);
   const [report, setReport] = useState<WeatherReport | null>(null);
-  const [mapsApiKey, setMapsApiKey] = useState('');
   const [loading, setLoading] = useState(true);
   const [locating, setLocating] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const lastQueryRef = useRef<{ location?: string; lat?: number; lng?: number }>({
     location: defaultLocation,
   });
-
-  useEffect(() => {
-    getGoogleMapsApiKey().then((key) => setMapsApiKey(key)).catch(() => {});
-  }, []);
 
   const loadWeather = useCallback(
     async (params: { location?: string; lat?: number; lng?: number }, langOverride?: string) => {
@@ -103,12 +98,12 @@ export const WeatherWidget: React.FC<WeatherWidgetProps> = ({
   }, [defaultLocation, currentLang, loadWeather]);
 
   const weatherDynamicTexts = useMemo(() => {
-    if (!report) return [];
+    if (!report?.current) return [];
     return [
       report.locationName,
       report.current.conditionText,
       report.current.windDirection,
-      ...report.daily.map((d) => d.conditionText),
+      ...(report.daily ?? []).map((d) => d?.conditionText),
     ];
   }, [report]);
 
@@ -248,7 +243,7 @@ export const WeatherWidget: React.FC<WeatherWidgetProps> = ({
       )}
 
       {/* Loaded Weather Dashboard */}
-      {report && (
+      {report?.current && (
         <div className="mt-5 space-y-6">
           {/* Current Weather Metrics Grid */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
@@ -470,12 +465,10 @@ export const WeatherWidget: React.FC<WeatherWidgetProps> = ({
               </Link>
             </div>
             <AgriServicesMap
-              apiKey={mapsApiKey}
               center={{ lat: report.latitude, lng: report.longitude }}
               centerLabel={tr(report.locationName)}
               heightClassName="h-[240px]"
               zoom={11}
-              language={currentLang}
             />
           </div>
         </div>

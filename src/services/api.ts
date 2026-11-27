@@ -121,8 +121,65 @@ export async function fetchWeather(params: {
   location?: string;
   lat?: number;
   lng?: number;
+  locationName?: string;
   lang?: string;
 }): Promise<WeatherReport> {
+  const qs = new URLSearchParams();
+  if (params.lat !== undefined && params.lng !== undefined) {
+    qs.set('lat', String(params.lat));
+    qs.set('lng', String(params.lng));
+    if (params.locationName?.trim()) {
+      qs.set('locationName', params.locationName.trim());
+    }
+  } else if (params.location?.trim()) {
+    qs.set('location', params.location.trim());
+  }
+  if (params.lang) {
+    qs.set('lang', params.lang);
+  }
+
+  const res = await fetch(`/api/weather?${qs.toString()}`);
+  const data = await res.json().catch(() => ({}));
+
+  if (res.status === 429) {
+    throw new Error(
+      typeof data?.error === 'string'
+        ? data.error
+        : 'Weather service rate limit reached. Please try again in a moment.'
+    );
+  }
+
+  if (!res.ok) {
+    throw new Error(data?.error || 'Unable to load local weather forecast.');
+  }
+
+  if (
+    !data ||
+    typeof data !== 'object' ||
+    !data.current ||
+    typeof data.latitude !== 'number' ||
+    typeof data.longitude !== 'number'
+  ) {
+    throw new Error(
+      (typeof data?.error === 'string' && data.error) ||
+        'Unable to load local weather forecast.'
+    );
+  }
+
+  return {
+    ...data,
+    advisories: Array.isArray(data.advisories) ? data.advisories : [],
+    hourly: Array.isArray(data.hourly) ? data.hourly : [],
+    daily: Array.isArray(data.daily) ? data.daily : [],
+  } as WeatherReport;
+}
+
+export async function geocodeLocation(params: {
+  location?: string;
+  lat?: number;
+  lng?: number;
+  lang?: string;
+}): Promise<{ latitude: number; longitude: number; locationName: string }> {
   const qs = new URLSearchParams();
   if (params.lat !== undefined && params.lng !== undefined) {
     qs.set('lat', String(params.lat));
@@ -134,48 +191,37 @@ export async function fetchWeather(params: {
     qs.set('lang', params.lang);
   }
 
-  const res = await fetch(`/api/weather?${qs.toString()}`);
-  const data = await res.json().catch(() => ({}));
+  const res = await fetch(`/api/maps/geocode?${qs.toString()}`);
+  const data = (await res.json().catch(() => ({}))) as {
+    latitude?: number;
+    longitude?: number;
+    locationName?: string;
+    error?: string;
+  };
 
-  if (res.status === 429 || data?.quotaExceeded || data?.error?.status === 'RESOURCE_EXHAUSTED') {
-    window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+  if (res.status === 429) {
     throw new Error(
-      data?.error || 'Google Maps Platform quota reached for this demo key.'
+      data?.error || 'Location search rate limit reached. Please wait a second and try again.'
     );
   }
 
-  if (!res.ok) {
-    throw new Error(data?.error || 'Unable to load local weather forecast.');
+  if (!res.ok || typeof data.latitude !== 'number' || typeof data.longitude !== 'number') {
+    throw new Error(data?.error || 'Unable to resolve the requested location.');
   }
 
-  return data as WeatherReport;
-}
-
-let cachedMapsApiKey: string | null = null;
-
-export async function getGoogleMapsApiKey(): Promise<string> {
-  const envKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined;
-  if (envKey && envKey.trim()) {
-    cachedMapsApiKey = envKey.trim();
-    return cachedMapsApiKey;
-  }
-  if (cachedMapsApiKey) {
-    return cachedMapsApiKey;
-  }
-  const res = await fetch('/api/maps/config');
-  if (!res.ok) return '';
-  const data = (await res.json().catch(() => ({}))) as { apiKey?: string };
-  const key = (data.apiKey || '').trim();
-  if (key) {
-    cachedMapsApiKey = key;
-  }
-  return key;
+  return {
+    latitude: data.latitude,
+    longitude: data.longitude,
+    locationName: data.locationName || params.location || 'India',
+  };
 }
 
 export async function searchNearbyAgriPlaces(payload: {
-  textQuery: string;
-  lat?: number;
-  lng?: number;
+  categoryId?: string;
+  textQuery?: string;
+  textQueries?: string[];
+  lat: number;
+  lng: number;
   radiusMeters?: number;
   languageCode?: string;
 }): Promise<AgriPlaceItem[]> {
@@ -186,17 +232,14 @@ export async function searchNearbyAgriPlaces(payload: {
   });
   const data = (await res.json().catch(() => ({}))) as {
     places?: AgriPlaceItem[];
-    quotaExceeded?: boolean;
     error?: string | { status?: string; message?: string };
   };
 
-  const errStatus = typeof data?.error === 'object' ? data.error?.status : undefined;
-  if (res.status === 429 || data?.quotaExceeded || errStatus === 'RESOURCE_EXHAUSTED') {
-    window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+  if (res.status === 429) {
     const errMessage =
       typeof data?.error === 'string'
         ? data.error
-        : 'Google Maps Platform quota reached for this demo key.';
+        : 'Map search rate limit reached. Please wait a few seconds and try again.';
     throw new Error(errMessage);
   }
 
@@ -210,6 +253,41 @@ export async function searchNearbyAgriPlaces(payload: {
 
   return Array.isArray(data?.places) ? data.places : [];
 }
+
+export async function fetchDirectionsRoute(payload: {
+  fromLat: number;
+  fromLng: number;
+  toLat: number;
+  toLng: number;
+}): Promise<{
+  coordinates: Array<[number, number]>;
+  distanceKm: number;
+  durationMin: number;
+  provider: string;
+}> {
+  const res = await fetch('/api/maps/directions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = (await res.json().catch(() => ({}))) as {
+    coordinates?: Array<[number, number]>;
+    distanceKm?: number;
+    durationMin?: number;
+    provider?: string;
+    error?: string;
+  };
+  if (!res.ok || !Array.isArray(data.coordinates)) {
+    throw new Error(data?.error || 'Unable to calculate driving directions right now.');
+  }
+  return {
+    coordinates: data.coordinates,
+    distanceKm: Number(data.distanceKm ?? 0),
+    durationMin: Number(data.durationMin ?? 0),
+    provider: data.provider || 'OpenRouteService',
+  };
+}
+
 
 export async function sendContactMessage(payload: {
   name: string;
